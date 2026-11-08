@@ -41,6 +41,9 @@ CREATE TABLE aliases (
 CREATE TABLE tree_dirs (path TEXT PRIMARY KEY, created_at INTEGER);
 CREATE TABLE shadow (path TEXT PRIMARY KEY, blob_ref TEXT, size INTEGER, mtime INTEGER);
 CREATE TABLE sync_state (key TEXT PRIMARY KEY, value TEXT);
+`, `
+ALTER TABLE variants ADD COLUMN changed_at INTEGER;
+CREATE TABLE node_ops (id INTEGER PRIMARY KEY, uuid TEXT NOT NULL, ops TEXT NOT NULL);
 `}
 
 const (
