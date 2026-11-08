@@ -3,6 +3,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sync"
 	"time"
@@ -112,6 +113,12 @@ func (c *Client) Info(ctx context.Context, uuid string) (File, error) {
 		return File{}, err
 	}
 	return fromInfo(&info), nil
+}
+
+// IsNotFound reports a REST 404.
+func IsNotFound(err error) bool {
+	var apiErr ucare.APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound
 }
 
 // AutostoreEnabled reports the project setting that decides whether uploads
