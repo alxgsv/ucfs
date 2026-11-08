@@ -11,7 +11,7 @@
 	<string>com.uploadcare.ucfs</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/opt/homebrew/bin/ucfs</string>
+		<string>/usr/local/bin/ucfs</string>
 		<string>mount</string>
 		<string>/Users/YOU/Uploadcare</string>
 	</array>

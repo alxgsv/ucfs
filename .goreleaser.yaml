@@ -64,8 +64,12 @@ brews:
     directory: Formula
     homepage: https://github.com/alxgsv/ucfs
     description: Mount an Uploadcare project as a local filesystem
+    license: MIT
     commit_msg_template: "ucfs {{ .Tag }}"
-    skip_upload: auto
+    # Releases ship without Homebrew until alxgsv/homebrew-tap and
+    # HOMEBREW_TAP_TOKEN exist: the formula is built into dist/ and attached
+    # nowhere. Set to auto then, which also skips pre-releases.
+    skip_upload: true
     install: |
       bin.install "ucfs"
       pkgshare.install "contrib"

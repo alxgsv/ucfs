@@ -22,18 +22,16 @@ $ ucfs resolve ~/Uploadcare/tree/pets/cat.jpg
 macOS needs nothing else: ucfs serves NFS on 127.0.0.1 and mounts it with the built-in `mount_nfs`, as you, without
 `sudo` or a kernel extension. Linux needs FUSE 3 (`fusermount3`, package `fuse3`).
 
-The first two ways need a published release ([docs/release.md](docs/release.md)); until then, build from source.
-
-- Homebrew (macOS, Linux): `brew install alxgsv/tap/ucfs`. Installing by the full name also trusts the formula,
-  which Homebrew 6 and later require for a third-party tap.
-- Install script: `curl -fsSL https://raw.githubusercontent.com/alxgsv/ucfs/main/scripts/install.sh | sh` puts
-  `ucfs` in `/usr/local/bin` (with `sudo` if that is not writable); `... | sh -s -- --install-dir ~/.local/bin`
-  does without `sudo`. `--version 0.1.0` picks a version, `UNINSTALL=1` removes it.
+- Install script, once a release is published ([docs/release.md](docs/release.md)):
+  `curl -fsSL https://raw.githubusercontent.com/alxgsv/ucfs/main/scripts/install.sh | sh` puts `ucfs` in
+  `/usr/local/bin` (with `sudo` if that is not writable); `... | sh -s -- --install-dir ~/.local/bin` does without
+  `sudo`. `--version 0.1.0` picks a version, `UNINSTALL=1` removes it.
 - From source, with Go 1.26: `make build` writes `bin/ucfs`.
+- Homebrew comes after 0.1.0, as `brew install alxgsv/tap/ucfs`.
 
-The binaries are not signed by Apple or notarized. Neither Homebrew nor the install script marks them as downloaded,
-so Gatekeeper does not stop them; an archive downloaded with a browser is quarantined like any download
-(`xattr -d com.apple.quarantine ucfs` clears it).
+The binaries are not signed by Apple or notarized. The install script does not mark them as downloaded, so
+Gatekeeper does not stop them; an archive downloaded with a browser is quarantined like any download, and macOS
+refuses to run it until `xattr -d com.apple.quarantine ucfs`.
 
 ## Credentials
 
@@ -107,4 +105,4 @@ so a stray `rm -r` cannot empty a project. `--read-only` refuses every write.
 
 ## License
 
-Not chosen yet; see [docs/release.md](docs/release.md).
+[MIT](LICENSE).

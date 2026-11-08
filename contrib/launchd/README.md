@@ -7,14 +7,15 @@ restarts after a failure, and stays down after `ucfs umount`. Logs go to `~/Libr
 
 ```sh
 mkdir -p ~/Uploadcare ~/Library/Logs ~/Library/LaunchAgents
-sed -e "s|/Users/YOU|$HOME|g" -e "s|/opt/homebrew/bin/ucfs|$(command -v ucfs)|" \
+sed -e "s|/Users/YOU|$HOME|g" -e "s|/usr/local/bin/ucfs|$(command -v ucfs)|" \
   com.uploadcare.ucfs.example.plist > ~/Library/LaunchAgents/com.uploadcare.ucfs.plist
 plutil -lint ~/Library/LaunchAgents/com.uploadcare.ucfs.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.uploadcare.ucfs.plist
 ucfs status ~/Uploadcare
 ```
 
-Homebrew puts this file in `$(brew --prefix)/share/ucfs/contrib/launchd/`. Add flags such as `--project`,
+The release archives hold this file under `contrib/launchd/`, and a Homebrew install in
+`$(brew --prefix)/share/ucfs/contrib/launchd/`. Add flags such as `--project`,
 `--read-only` or `--views` as more `<string>` elements after `mount`, before the mount directory. The agent reads
 `~/.uploadcare/config.yaml` like the command line does; launchd passes no shell environment, so
 `UPLOADCARE_*` variables set in a shell profile do not reach it (use an `EnvironmentVariables` dictionary).

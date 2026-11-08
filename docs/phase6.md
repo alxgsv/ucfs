@@ -10,7 +10,7 @@ listed names.
 
 | Item | Check | Result |
 |---|---|---|
-| 39 | `docs/release.md`: both owners, licence, Gatekeeper, steps, places to rename | written; nothing outward-facing done |
+| 39 | `docs/release.md`: owner, licence, Gatekeeper, steps, places to rename | decided after the measurements: `alxgsv`, MIT, no Homebrew in 0.1.0; nothing outward-facing done |
 | 40 | `goreleaser check` | 2.14.3: exit 0, deprecation note for `brews`; 2.20.0: exit 2 for the same deprecation only |
 | 40 | `make snapshot` | 2.97 s; four archives of 5.32–5.92 MB, `checksums.txt`, formula |
 | 40 | `install.sh` from a local server | macOS 0.41 s, Linux 0.065 s; argument tests pass on both shells |
@@ -94,9 +94,13 @@ load third-party taps only when trusted), and uninstalling removed it again.
 goreleaser-action v7). actionlint was not run: installing it was refused in this session. Actions cannot start jobs
 on this account, so the workflow itself has not run.
 
-**What the fresh-Mac test still needs:** a real release (public repository, tap, `HOMEBREW_TAP_TOKEN`, tag
-`v0.1.0`), run on a Mac with Gatekeeper on: `brew install alxgsv/tap/ucfs`, the install script from GitHub, and a
-first `ucfs mount`. Steps in [release.md](release.md).
+**What the fresh-Mac test still needs:** a Mac with Gatekeeper on, and the release (public repository, tag
+`v0.1.0`) or the snapshot served to it: the install script, a browser download, and a first `ucfs mount`. Steps in
+[release.md](release.md#testing-on-a-fresh-mac).
+
+**After the decisions** (owner `alxgsv`, MIT, no Homebrew in 0.1.0): with `LICENSE` added, `make snapshot` packs it
+into every archive (darwin/arm64 now 5,322,736 bytes), the formula states `license "MIT"`, and `skip_upload: true`
+keeps it in `dist/`: goreleaser 2.20's brew pipe returns before it reads the token when that is set.
 
 ## 41: persistent mounts
 

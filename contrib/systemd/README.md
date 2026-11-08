@@ -7,7 +7,8 @@ a clean unmount. Logs go to the journal.
 ## Install
 
 The unit runs `/usr/local/bin/ucfs`, where `install.sh` puts it; change both paths if yours is elsewhere
-(`command -v ucfs`). Homebrew puts this file in `$(brew --prefix)/share/ucfs/contrib/systemd/`.
+(`command -v ucfs`). The release archives hold this file under `contrib/systemd/`, and a Homebrew install in
+`$(brew --prefix)/share/ucfs/contrib/systemd/`.
 
 ```sh
 mkdir -p ~/Uploadcare ~/.config/systemd/user
