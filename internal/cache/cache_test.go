@@ -12,29 +12,46 @@ import (
 )
 
 type fakeFetcher struct {
+	mu      sync.Mutex
 	data    map[string][]byte
+	etags   map[string]string
 	delay   time.Duration
 	calls   atomic.Int64
 	fetched atomic.Int64
 	fail    error
 }
 
-func (f *fakeFetcher) ReadRange(ctx context.Context, uuid, _ string, p []byte, off int64) (int, error) {
+func (f *fakeFetcher) ReadRange(ctx context.Context, uuid, _ string, p []byte, off int64) (int, string, error) {
 	f.calls.Add(1)
 	if f.fail != nil {
-		return 0, f.fail
+		return 0, "", f.fail
 	}
 	select {
 	case <-time.After(f.delay):
 	case <-ctx.Done():
-		return 0, ctx.Err()
+		return 0, "", ctx.Err()
 	}
-	n := copy(p, f.data[uuid][off:])
+	f.mu.Lock()
+	data, etag := f.data[uuid], f.etags[uuid]
+	f.mu.Unlock()
+	n := copy(p, data[off:])
 	f.fetched.Add(int64(n))
 	if n < len(p) {
-		return n, io.ErrUnexpectedEOF
+		return n, etag, io.ErrUnexpectedEOF
 	}
-	return n, nil
+	return n, etag, nil
+}
+
+// set replaces an object's content and ETag, as the CDN serving a new
+// rendering would.
+func (f *fakeFetcher) set(uuid string, data []byte, etag string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.data[uuid] = data
+	if f.etags == nil {
+		f.etags = map[string]string{}
+	}
+	f.etags[uuid] = etag
 }
 
 func pattern(n int, seed byte) []byte {

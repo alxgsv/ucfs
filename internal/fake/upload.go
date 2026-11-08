@@ -1,9 +1,12 @@
 package fake
 
 import (
+	"bytes"
+	"crypto/md5"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"math/rand/v2"
 	"mime"
@@ -100,13 +103,48 @@ func (s *Server) Pending() []string {
 }
 
 func (s *Server) content(f File) []byte {
+	b := make([]byte, f.Size)
+	r, _ := s.original(f)
+	_, _ = r.ReadAt(b, 0)
+	return b
+}
+
+// md5Limit is the largest generated file whose ETag is its MD5, as the
+// CDN's is for base uploads; larger ones get a tag derived from the uuid,
+// so a range of a large file costs only the bytes asked for.
+const md5Limit = 16 << 20
+
+// original is what the CDN serves for a file: an upload's bytes, or
+// content generated from the uuid and the ChangeOriginal count, and its
+// ETag.
+func (s *Server) original(f File) (*io.SectionReader, string) {
 	s.mu.Lock()
-	b, ok := s.up.content[f.UUID]
+	b, uploaded := s.up.content[f.UUID]
+	gen := s.originalGen[f.UUID]
 	s.mu.Unlock()
-	if ok {
-		return b
+	if uploaded && gen == 0 {
+		return io.NewSectionReader(bytes.NewReader(b), 0, int64(len(b))), fmt.Sprintf(`"%x"`, md5.Sum(b))
 	}
-	return Content(f.UUID, f.Size)
+	key := f.UUID
+	if gen > 0 {
+		key += "#" + strconv.Itoa(gen)
+	}
+	r := io.NewSectionReader(generated(key), 0, f.Size)
+	if f.Size > md5Limit {
+		h := fnv.New64a()
+		_, _ = h.Write([]byte(key))
+		return r, fmt.Sprintf(`"%016x%016x"`, h.Sum64(), f.Size)
+	}
+	s.mu.Lock()
+	etag, ok := s.etags[key]
+	s.mu.Unlock()
+	if !ok {
+		etag = fmt.Sprintf(`"%x"`, md5.Sum(Content(key, f.Size)))
+		s.mu.Lock()
+		s.etags[key] = etag
+		s.mu.Unlock()
+	}
+	return r, etag
 }
 
 func newUUID() string {

@@ -26,22 +26,35 @@ type BadRequestError struct {
 
 func (e *BadRequestError) Error() string { return "cdn " + e.URL + ": 400 " + e.Message }
 
+// StatusError is a CDN answer the client has no meaning for, such as 403,
+// 429 or a 5xx; api.Errno maps it by status.
+type StatusError struct {
+	Method, URL string
+	Status      int
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("cdn %s %s: %d %s", e.Method, e.URL, e.Status, http.StatusText(e.Status))
+}
+
 type Client struct {
 	base               string
 	hc                 *http.Client
+	lim                *Limiter
 	heads, gets, bytes atomic.Int64
 }
 
 // New returns a client for the CDN base URL. A nil transport means a clone of
 // http.DefaultTransport with more idle connections per host, since every
-// concurrent block fetch goes to the same host.
-func New(base string, rt http.RoundTripper) *Client {
+// concurrent block fetch goes to the same host. HEADs take a slot of lim,
+// when given; range reads are the cache's to schedule.
+func New(base string, rt http.RoundTripper, lim *Limiter) *Client {
 	if rt == nil {
 		t := http.DefaultTransport.(*http.Transport).Clone()
 		t.MaxIdleConnsPerHost = 64
 		rt = t
 	}
-	return &Client{base: strings.TrimSuffix(base, "/"), hc: &http.Client{Transport: rt}}
+	return &Client{base: strings.TrimSuffix(base, "/"), hc: &http.Client{Transport: rt}, lim: lim}
 }
 
 // URL is the CDN URL of an original (ops empty) or of a variant, ops being a
@@ -58,6 +71,13 @@ type Info struct {
 }
 
 func (c *Client) Head(ctx context.Context, uuid, ops string) (Info, error) {
+	if c.lim != nil {
+		release, err := c.lim.Acquire(ctx, uuid+"/"+ops)
+		if err != nil {
+			return Info{}, err
+		}
+		defer release()
+	}
 	resp, err := c.do(ctx, http.MethodHead, uuid, ops, "")
 	if err != nil {
 		return Info{}, err
@@ -87,37 +107,45 @@ func (c *Client) badRequest(ctx context.Context, uuid, ops string) error {
 	return bad
 }
 
-// ReadRange fills p with the bytes at off. The caller sizes p to end at or
-// before EOF, so a short body is an error.
-func (c *Client) ReadRange(ctx context.Context, uuid, ops string, p []byte, off int64) (int, error) {
+// ReadRange fills p with the bytes at off and returns the ETag they came
+// with. The caller sizes p to end at or before EOF, so a short body is an
+// error.
+func (c *Client) ReadRange(ctx context.Context, uuid, ops string, p []byte, off int64) (int, string, error) {
 	if len(p) == 0 {
-		return 0, nil
+		return 0, "", nil
 	}
 	rng := fmt.Sprintf("bytes=%d-%d", off, off+int64(len(p))-1)
 	resp, err := c.do(ctx, http.MethodGet, uuid, ops, rng)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	etag := resp.Header.Get("ETag")
 	switch resp.StatusCode {
 	case http.StatusPartialContent:
 		if start, ok := rangeStart(resp.Header.Get("Content-Range")); !ok || start != off {
-			return 0, fmt.Errorf("cdn %s: Content-Range %q does not start at %d", c.URL(uuid, ops), resp.Header.Get("Content-Range"), off)
+			return 0, etag, fmt.Errorf("cdn %s: Content-Range %q does not start at %d", c.URL(uuid, ops), resp.Header.Get("Content-Range"), off)
 		}
 	case http.StatusOK:
 		// The range was ignored and the body starts at 0; only usable from 0.
 		if off != 0 {
-			return 0, fmt.Errorf("cdn %s: range ignored", c.URL(uuid, ops))
+			return 0, etag, fmt.Errorf("cdn %s: range ignored", c.URL(uuid, ops))
 		}
 	case http.StatusRequestedRangeNotSatisfiable:
-		return 0, io.EOF
+		return 0, etag, io.EOF
 	default:
-		return 0, c.statusErr(resp, http.StatusPartialContent)
+		return 0, etag, c.statusErr(resp, http.StatusPartialContent)
 	}
 	n, err := io.ReadFull(resp.Body, p)
 	c.bytes.Add(int64(n))
 	slog.Debug("cdn read", "uuid", uuid, "ops", ops, "off", off, "bytes", n)
-	return n, err
+	return n, etag, err
+}
+
+// SameETag compares ETags weakly (RFC 9110 §8.8.3.2): the CDN marks variant
+// ETags weak and the comparison ignores that.
+func SameETag(a, b string) bool {
+	return strings.TrimPrefix(a, "W/") == strings.TrimPrefix(b, "W/")
 }
 
 func (c *Client) do(ctx context.Context, method, uuid, ops, rng string) (*http.Response, error) {
@@ -151,7 +179,7 @@ func (c *Client) statusErr(resp *http.Response, want int) error {
 		c.bytes.Add(int64(len(body)))
 		return &BadRequestError{URL: resp.Request.URL.String(), Message: errorMessage(body)}
 	default:
-		return fmt.Errorf("cdn %s %s: %s", resp.Request.Method, resp.Request.URL, resp.Status)
+		return &StatusError{Method: resp.Request.Method, URL: resp.Request.URL.String(), Status: resp.StatusCode}
 	}
 }
 

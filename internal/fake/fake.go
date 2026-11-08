@@ -4,7 +4,6 @@ package fake
 
 import (
 	"bytes"
-	"crypto/md5"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -66,10 +65,19 @@ type Server struct {
 	up          uploads
 	groups      []Group
 	noTags      atomic.Bool
+
+	denied        bool
+	throttleAfter int
+	cdnStatus     int
+	originalGen   map[string]int
+	etags         map[string]string
+	restLatency   time.Duration
+	restInflight  int
+	restPeak      int
 }
 
 func New(t testing.TB) *Server {
-	s := &Server{latency: map[string]time.Duration{}}
+	s := &Server{latency: map[string]time.Duration{}, originalGen: map[string]int{}, etags: map[string]string{}}
 	rest := http.NewServeMux()
 	rest.HandleFunc("GET /files/", s.listFiles)
 	rest.HandleFunc("GET /files/{uuid}/", s.fileInfo)
@@ -103,14 +111,38 @@ func (s *Server) CDNBase() string { return s.URL + "/cdn" }
 
 // Content is the deterministic body the fake CDN serves for a file.
 func Content(uuid string, size int64) []byte {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(uuid))
-	r := rand.New(rand.NewPCG(h.Sum64(), 0))
 	b := make([]byte, size)
-	for i := range b {
-		b[i] = byte(r.Uint32())
-	}
+	_, _ = generated(uuid).ReadAt(b, 0)
 	return b
+}
+
+// genChunk is the unit content is generated in, so any range of a large
+// file is made without the bytes before it.
+const genChunk = 64 << 10
+
+// generated is a file's content as a ReaderAt that makes the bytes asked
+// for: each chunk is a random stream seeded by the uuid and its index.
+type generated string
+
+func (g generated) ReadAt(p []byte, off int64) (int, error) {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(g))
+	seed := h.Sum64()
+	n := 0
+	for n < len(p) {
+		pos := off + int64(n)
+		chunk := pos / genChunk
+		r := rand.New(rand.NewPCG(seed, uint64(chunk)))
+		skip := pos - chunk*genChunk
+		for range skip {
+			r.Uint32()
+		}
+		for i := skip; i < genChunk && n < len(p); i++ {
+			p[n] = byte(r.Uint32())
+			n++
+		}
+	}
+	return n, nil
 }
 
 // BadArg is the argument the fake CDN rejects with 400, as the real one
@@ -211,6 +243,7 @@ func (s *Server) serveCDN(w http.ResponseWriter, r *http.Request) {
 	}
 	delay := s.latency[uuid]
 	gen := s.variantsGen
+	failStatus := s.cdnStatus
 	s.mu.Unlock()
 	time.Sleep(delay)
 	cw := &countingWriter{ResponseWriter: w}
@@ -220,6 +253,8 @@ func (s *Server) serveCDN(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 	}()
 	switch {
+	case failStatus != 0:
+		http.Error(cw, http.StatusText(failStatus), failStatus)
 	case !ok || f.Removed:
 		http.NotFound(cw, r)
 	case slices.Contains(strings.Split(ops, "/"), BadArg):
@@ -228,9 +263,9 @@ func (s *Server) serveCDN(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprintf(cw, "<html><head><title>400: Bad Request</title></head><body><h3>Bad Request</h3>\n"+
 			"<p>Cannot parse url part: %s</p>\n<p>See <a href=\"https://uploadcare.com/docs/\">CDN documentation</a>.</p></body></html>", BadArg)
 	case ops == "":
-		body := s.content(f)
-		cw.Header().Set("ETag", fmt.Sprintf(`"%x"`, md5.Sum(body)))
-		http.ServeContent(cw, r, "", f.Uploaded, bytes.NewReader(body))
+		body, etag := s.original(f)
+		cw.Header().Set("ETag", etag)
+		http.ServeContent(cw, r, "", f.Uploaded, body)
 	default:
 		body, etag, mime := variant(f, ops, gen)
 		cw.Header().Set("ETag", etag)
@@ -302,6 +337,10 @@ func (s *Server) count(next http.Handler) http.Handler {
 		if throttled {
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, `{"detail":"Request was throttled."}`, http.StatusTooManyRequests)
+			return
+		}
+		defer s.restEnter(r)()
+		if s.restFailure(w, r) {
 			return
 		}
 		next.ServeHTTP(w, r)

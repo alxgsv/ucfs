@@ -54,8 +54,63 @@ const renameWarn = 1000
 
 // EnableWrites makes the filesystem writable.
 func (f *FS) EnableWrites(w *Writes) {
+	w.API = gatedREST{REST: w.API, f: f}
 	f.w = w
 	w.Spools.OnChange = f.Touch
+}
+
+// degraded is the error writes fail with while the API is denied or
+// throttled (Options.Gate): its errno is EACCES or EAGAIN.
+func (f *FS) degraded() error {
+	if f.opts.Gate == nil {
+		return nil
+	}
+	return f.opts.Gate()
+}
+
+// gatedREST refuses API writes while the API is degraded, rather than
+// sending requests that fail or wait out throttling for minutes.
+type gatedREST struct {
+	REST
+	f *FS
+}
+
+func (g gatedREST) DeleteStorage(ctx context.Context, uuid string) error {
+	if err := g.f.degraded(); err != nil {
+		return err
+	}
+	return g.REST.DeleteStorage(ctx, uuid)
+}
+
+func (g gatedREST) SetMetadata(ctx context.Context, uuid, key, value string) error {
+	if err := g.f.degraded(); err != nil {
+		return err
+	}
+	return g.REST.SetMetadata(ctx, uuid, key, value)
+}
+
+func (g gatedREST) DeleteMetadata(ctx context.Context, uuid, key string) error {
+	if err := g.f.degraded(); err != nil {
+		return err
+	}
+	return g.REST.DeleteMetadata(ctx, uuid, key)
+}
+
+func (g gatedREST) SetTags(ctx context.Context, uuid string, tags []string) ([]string, error) {
+	if err := g.f.degraded(); err != nil {
+		return nil, err
+	}
+	return g.REST.SetTags(ctx, uuid, tags)
+}
+
+// createSpool starts a spool, which ends in an upload, unless the API is
+// degraded: NFS cannot report a failed upload to the writer, so the write
+// is refused up front.
+func (f *FS) createSpool(ctx context.Context, p string, o index.Object, replaces string) (*spool.Spool, error) {
+	if err := f.degraded(); err != nil {
+		return nil, api.Errno(err)
+	}
+	return f.w.Spools.Create(ctx, p, o, replaces)
 }
 
 func (f *FS) Writable() bool { return f.w != nil }
@@ -172,7 +227,7 @@ func (f *FS) Create(ctx context.Context, dir Node, name string) (Entry, error) {
 }
 
 func (f *FS) newSpool(ctx context.Context, p string, o index.Object, replaces, name string) (Entry, error) {
-	s, err := f.w.Spools.Create(ctx, p, o, replaces)
+	s, err := f.createSpool(ctx, p, o, replaces)
 	if err != nil {
 		return Entry{}, err
 	}
@@ -199,7 +254,7 @@ func (f *FS) overwrite(ctx context.Context, n Node, file index.File) (*spool.Spo
 	if strings.HasPrefix(mp, TreeDir+"/"+InboxDir+"/") {
 		mp = FilesDir + "/" + path.Base(mp)
 	}
-	return f.w.Spools.Create(ctx, mp, index.Object{Ino: n.Ino, Key: n.UUID}, file.UUID)
+	return f.createSpool(ctx, mp, index.Object{Ino: n.Ino, Key: n.UUID}, file.UUID)
 }
 
 // reopen continues a write after its file was uploaded too early, as when
@@ -804,7 +859,7 @@ func (f *FS) renameShadow(ctx context.Context, from string, src Entry, to string
 	if exists && dst.Node.Kind == KindTreeFile {
 		o = index.Object{Ino: dst.Node.Ino, Key: dst.Node.UUID}
 	}
-	s, err := f.w.Spools.Create(ctx, to, o, replaces)
+	s, err := f.createSpool(ctx, to, o, replaces)
 	if err != nil {
 		return err
 	}

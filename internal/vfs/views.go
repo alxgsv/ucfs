@@ -53,6 +53,12 @@ type Options struct {
 	// Remote refreshes file info and reads groups; without it the
 	// filesystem answers from the index alone.
 	Remote Remote
+	// Gate reports whether the API is degraded: denied or throttled for
+	// longer than a sync interval. While it returns an error, whose errno
+	// is EACCES or EAGAIN, the mount serves the index and the block cache,
+	// skips info refreshes, and refuses what would need the API: new
+	// spools, deletes, renames and metadata changes of uploaded files.
+	Gate func() error
 }
 
 // DefaultMetaTTL is how long file info read from the API counts as current.
@@ -376,6 +382,9 @@ func (f *FS) group(ctx context.Context, id string) (index.Group, error) {
 }
 
 func (f *FS) fetchGroup(ctx context.Context, id string) error {
+	if err := f.degraded(); err != nil {
+		return api.Errno(err)
+	}
 	f.stats.groupFetches.Add(1)
 	g, err := f.opts.Remote.GroupInfo(context.WithoutCancel(ctx), id)
 	switch {

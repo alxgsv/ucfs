@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"time"
@@ -36,6 +37,8 @@ type mountFlags struct {
 	views         []string
 	metaTTL       time.Duration
 	dateZone      string
+	budget        string
+	maxInflight   int
 	writeFlags
 }
 
@@ -70,6 +73,9 @@ func newMountCmd(g *globalFlags) *cobra.Command {
 	fl.DurationVar(&f.metaTTL, "meta-ttl", vfs.DefaultMetaTTL,
 		"reading xattrs or resolving a file fetches its info again when the index copy is older than this")
 	fl.StringVar(&f.dateZone, "by-date-zone", "Local", "time zone of by-date/: Local, UTC or a zone name such as Europe/Berlin")
+	fl.StringVar(&f.budget, "traffic-budget", "",
+		"CDN bytes per day, such as 500MB or 2GiB; reads past it fail with EDQUOT until local midnight")
+	fl.IntVar(&f.maxInflight, "max-inflight", cdn.DefaultMaxInflight, "CDN requests in flight at once")
 	f.register(fl)
 	return cmd
 }
@@ -97,6 +103,19 @@ func (f *mountFlags) viewOptions() (vfs.Options, error) {
 	return o, nil
 }
 
+// trafficBudget parses --traffic-budget, with or without a "/day" suffix;
+// zero means no budget.
+func (f *mountFlags) trafficBudget() (int64, error) {
+	if f.budget == "" {
+		return 0, nil
+	}
+	n, err := humanize.ParseBytes(strings.TrimSuffix(f.budget, "/day"))
+	if err != nil || n == 0 {
+		return 0, fmt.Errorf("--traffic-budget %q: want a size such as 500MB or 2GiB", f.budget)
+	}
+	return int64(n), nil
+}
+
 func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) error {
 	opts, err := f.options()
 	if err != nil {
@@ -117,6 +136,13 @@ func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) er
 	if err != nil {
 		return fmt.Errorf("--cache-size: %w", err)
 	}
+	budgetBytes, err := f.trafficBudget()
+	if err != nil {
+		return err
+	}
+	if f.maxInflight < 1 {
+		return errors.New("--max-inflight must be at least 1")
+	}
 	cfg, err := g.load()
 	if err != nil {
 		return err
@@ -131,16 +157,39 @@ func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) er
 	}
 	defer func() { _ = ix.Close() }()
 
-	res, err := ix.Sync(ctx, client, false)
+	// An index synced before serves at once, whatever the API says now,
+	// and the loop brings it up to date in the background; a new one has
+	// nothing to serve until a full listing went through.
+	cursor, err := ix.Cursor(ctx)
 	if err != nil {
-		if res.Full {
+		return err
+	}
+	if cursor.IsZero() {
+		if _, err := ix.Sync(ctx, client, false); err != nil {
 			return fmt.Errorf("initial index sync: %w", err)
 		}
-		slog.Warn("index sync failed, serving the existing index", "err", err)
 	}
 
-	cd := cdn.New(cfg.CDNBase, nil)
-	c, err := cache.Open(cd, cache.Options{Dir: filepath.Join(cfg.CacheDir, "blocks"), MaxBytes: int64(maxCache)})
+	var budget *cache.Budget
+	if budgetBytes > 0 {
+		if budget, err = cache.NewBudget(ctx, budgetBytes, ix); err != nil {
+			return err
+		}
+		budgetCtx, stopBudget := context.WithCancel(context.WithoutCancel(ctx))
+		flushed := make(chan struct{})
+		go func() {
+			budget.Run(budgetCtx)
+			close(flushed)
+		}()
+		defer func() {
+			stopBudget()
+			<-flushed
+		}()
+	}
+	lim := cdn.NewLimiter(f.maxInflight)
+	cd := cdn.New(cfg.CDNBase, nil, lim)
+	c, err := cache.Open(cd, cache.Options{Dir: filepath.Join(cfg.CacheDir, "blocks"), MaxBytes: int64(maxCache),
+		Limiter: lim, Budget: budget})
 	if err != nil {
 		return err
 	}
@@ -152,6 +201,7 @@ func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) er
 	}
 	fsys := vfs.New(ix, c, cd, func(uuid string) { loop.Refresh(context.WithoutCancel(ctx), uuid) })
 	vopts.CDNBase, vopts.Remote = cfg.CDNBase, client
+	vopts.Gate = func() error { return client.Health().Degraded(time.Now(), f.syncInterval) }
 	fsys.Configure(vopts)
 	loop.Changed = fsys.Touch
 	journal := &spool.Journal{Path: filepath.Join(cfg.CacheDir, "uploads.log")}
@@ -196,25 +246,34 @@ func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) er
 	}
 	status := func() ctl.Status {
 		st := ctl.Status{MountDir: dir, Frontend: f.frontend, Project: name, PID: os.Getpid(), Started: started,
-			Views: fsys.Views()}
+			Views: fsys.Views(), Process: processStatus()}
 		if is, err := ix.Stats(context.Background()); err == nil {
 			st.Index.Files, st.Index.Bytes = is.Files, is.Bytes
 		}
-		last, serr := loop.Status()
-		if last.IsZero() {
-			last = started
+		st.Index.DBBytes = dbBytes(cfg.IndexPath())
+		ls := loop.Status()
+		st.Index.LastSync = ls.Last
+		if ls.Last.IsZero() {
+			st.Index.LastSync = started
 		}
-		st.Index.LastSync = last
-		if serr != nil {
-			st.Index.SyncError = serr.Error()
+		if ls.Err != nil {
+			st.Index.SyncError = ls.Err.Error()
 		}
-		cs := cd.Stats()
-		st.CDN = ctl.CDNStatus{Requests: cs.Requests, Heads: cs.Heads, Gets: cs.Gets, Bytes: cs.Bytes}
-		ks := c.Stats()
+		st.Index.SyncFailures, st.Index.NextSync = ls.Failures, ls.Next
+		cs, qs, ks := cd.Stats(), lim.Stats(), c.Stats()
+		st.CDN = ctl.CDNStatus{Requests: cs.Requests, Heads: cs.Heads, Gets: cs.Gets, Bytes: cs.Bytes,
+			MaxInflight: qs.Max, Inflight: qs.Inflight, Queued: qs.Queued, QueuedPrefetch: qs.QueuedPrefetch,
+			Waits: qs.Waits, WaitedMS: qs.Waited.Milliseconds(), Dropped: qs.Dropped, Changed: ks.Changed}
+		if budget != nil {
+			bs := budget.Status()
+			st.Budget = &ctl.Budget{Limit: bs.Limit, Used: bs.Used, Remaining: bs.Remaining, ResetsAt: bs.ResetsAt,
+				Refused: bs.Refused, Prefetch: bs.Prefetch}
+		}
 		st.Cache = ctl.CacheStatus{Served: ks.Served, Hit: ks.Hit, FetchedDemand: ks.FetchedDemand,
 			FetchedPrefetch: ks.FetchedPrefetch, Used: ks.Used, Max: ks.Max}
-		as := client.Stats()
-		st.API = ctl.APIStatus{REST: as.REST, Upload: as.Upload, Parts: as.Parts, Throttled: as.Throttled}
+		as, h := client.Stats(), client.Health()
+		st.API = ctl.APIStatus{REST: as.REST, Upload: as.Upload, Parts: as.Parts, Throttled: as.Throttled,
+			State: h.State, Since: h.Since, Detail: h.Detail, Degraded: h.Degraded(time.Now(), f.syncInterval) != nil}
 		ms := fsys.MetaStats()
 		st.Meta = ctl.MetaStatus{TTL: vopts.MetaTTL, Refreshes: ms.Refreshes, RefreshErrors: ms.RefreshErrors,
 			XattrLists: ms.Lists, XattrGets: ms.Gets, XattrSets: ms.Sets, XattrRemoves: ms.Removes,
@@ -256,6 +315,23 @@ func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) er
 		return nil
 	}
 	return m.Unmount()
+}
+
+func processStatus() ctl.ProcessStatus {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	fds, _ := os.ReadDir("/dev/fd")
+	return ctl.ProcessStatus{Goroutines: runtime.NumGoroutine(), FDs: len(fds), HeapBytes: m.HeapInuse}
+}
+
+func dbBytes(path string) int64 {
+	var n int64
+	for _, p := range []string{path, path + "-wal"} {
+		if fi, err := os.Stat(p); err == nil {
+			n += fi.Size()
+		}
+	}
+	return n
 }
 
 // register records the mount in the registry of running mounts and returns

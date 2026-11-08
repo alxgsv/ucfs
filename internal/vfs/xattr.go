@@ -89,7 +89,7 @@ func (f *FS) details(ctx context.Context, uuid string, refresh bool) (index.Deta
 		return d, syscall.ENOENT
 	case err != nil:
 		return d, f.ioErr("index lookup", err)
-	case !refresh || f.opts.Remote == nil || f.now().Sub(d.RefreshedAt) < f.opts.MetaTTL:
+	case !refresh || f.opts.Remote == nil || f.now().Sub(d.RefreshedAt) < f.opts.MetaTTL || f.degraded() != nil:
 		return d, nil
 	}
 	if _, err, _ := f.refreshes.Do(uuid, func() (any, error) { return nil, f.refresh(ctx, uuid) }); err != nil {

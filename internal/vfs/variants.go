@@ -8,6 +8,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/alxgsv/ucfs/internal/api"
 	"github.com/alxgsv/ucfs/internal/cache"
 	"github.com/alxgsv/ucfs/internal/cdn"
 	"github.com/alxgsv/ucfs/internal/index"
@@ -163,7 +164,7 @@ func (f *FS) head(ctx context.Context, old index.Variant, found bool) (index.Var
 		return old, f.fail(key, syscall.ENOENT, missingTTL)
 	case err != nil:
 		slog.Warn("variant HEAD", "uuid", old.UUID, "ops", old.Ops, "err", err)
-		return old, syscall.EIO
+		return old, api.Errno(err)
 	}
 	now := f.now()
 	v := index.Variant{UUID: old.UUID, Ops: old.Ops, Size: info.Size, MIME: info.MIME, ETag: info.ETag,
@@ -179,6 +180,14 @@ func (f *FS) head(ctx context.Context, old index.Variant, found bool) (index.Var
 		slog.Warn("store variant", "uuid", v.UUID, "ops", v.Ops, "err", err)
 	}
 	return v, nil
+}
+
+// staleVariant makes the next access to a variant send a new HEAD, after a
+// range came with another ETag than the HEAD's.
+func (f *FS) staleVariant(ctx context.Context, uuid, ops string) {
+	if err := f.ix.ExpireVariant(ctx, uuid, ops); err != nil {
+		slog.Warn("expire variant", "uuid", uuid, "ops", ops, "err", err)
+	}
 }
 
 func (f *FS) fail(key string, errno syscall.Errno, ttl time.Duration) error {

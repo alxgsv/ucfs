@@ -44,6 +44,12 @@ func (ix *Index) PutVariant(ctx context.Context, v Variant) error {
 
 // PutNodeOps records the operations path behind a node id, so a file handle
 // that carries only the id resolves after a restart.
+// ExpireVariant makes a variant's HEAD answer due for renewal.
+func (ix *Index) ExpireVariant(ctx context.Context, uuid, ops string) error {
+	_, err := ix.db.ExecContext(ctx, `UPDATE variants SET checked_at = 0 WHERE uuid = ? AND ops = ?`, uuid, ops)
+	return err
+}
+
 func (ix *Index) PutNodeOps(ctx context.Context, id uint64, uuid, ops string) error {
 	_, err := ix.db.ExecContext(ctx, `INSERT OR IGNORE INTO node_ops (id, uuid, ops) VALUES (?, ?, ?)`,
 		int64(id), uuid, ops)

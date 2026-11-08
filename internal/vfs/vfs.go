@@ -20,6 +20,7 @@ import (
 
 	"golang.org/x/sync/singleflight"
 
+	"github.com/alxgsv/ucfs/internal/api"
 	"github.com/alxgsv/ucfs/internal/cache"
 	"github.com/alxgsv/ucfs/internal/cdn"
 	"github.com/alxgsv/ucfs/internal/index"
@@ -480,21 +481,28 @@ func (f *FS) readFile(ctx context.Context, n Node, file index.File, p []byte, of
 		k, size = cache.Key{UUID: n.UUID, Ops: n.Ops, Version: v.ETag}, v.Size
 	}
 	got, err := f.cache.ReadAt(ctx, k, size, p, off)
-	var bad *cdn.BadRequestError
-	switch {
-	case err == nil || errors.Is(err, io.EOF):
+	if err == nil || errors.Is(err, io.EOF) {
 		return got, err
+	}
+	var bad *cdn.BadRequestError
+	var changed *cache.ChangedError
+	switch {
 	case errors.Is(err, cdn.ErrNotFound):
 		f.cache.Forget(k)
 		f.notFound(n.UUID)
-		return got, syscall.ENOENT
 	case errors.As(err, &bad):
 		slog.Info("CDN rejected a variant", "uuid", n.UUID, "ops", n.Ops, "message", bad.Message)
-		return got, syscall.EINVAL
+	case errors.As(err, &changed):
+		slog.Warn("content changed while being read; its cached blocks are dropped and the read fails",
+			"uuid", n.UUID, "ops", n.Ops, "etag", changed.Got, "was", changed.Want)
+		if n.Kind == KindVariant {
+			f.staleVariant(ctx, n.UUID, n.Ops)
+		}
+	case errors.Is(err, cache.ErrBudget):
 	default:
 		slog.Error("read", "uuid", n.UUID, "ops", n.Ops, "off", off, "err", err)
-		return got, syscall.EIO
 	}
+	return got, api.Errno(err)
 }
 
 func (f *FS) notFound(uuid string) {
