@@ -154,8 +154,17 @@ func (m *Manager) prepare(ctx context.Context, s *Spool) api.Upload {
 		meta[index.TreePathKey] = tp
 	}
 	name := path.Base(s.row.Path)
+	// A base upload keeps only what follows the last backslash of a name
+	// (Spike D), so such a name goes up with underscores and whole in
+	// ucfs:name, which the index shows instead.
+	sent := name
+	delete(meta, index.NameMetaKey)
+	if strings.ContainsRune(name, '\\') {
+		sent = strings.ReplaceAll(name, `\`, "_")
+		meta[index.NameMetaKey] = name
+	}
 	return api.Upload{
-		Name: name, Size: s.size, MIME: guessMIME(name, s.f), Data: s.f, Metadata: meta, Tags: tags,
+		Name: sent, Size: s.size, MIME: guessMIME(name, s.f), Data: s.f, Metadata: meta, Tags: tags,
 		Multipart: s.size > max(m.o.MultipartThreshold, api.MinMultipart) || s.size > api.MaxBase,
 		Started:   func(uuid string) { s.startedUpload(uuid) },
 	}

@@ -320,7 +320,7 @@ func TestViewPaths(t *testing.T) {
 			t.Errorf("path of %s = %q, %v", p, got, err)
 		}
 		env.FS.Remember(ctx, e.Node)
-		kind, id := e.Node.Kind, e.Node.ID()
+		kind, id := e.Node.Kind, env.FS.ID(e.Node)
 		if n, err := env.FS.NodeByID(ctx, kind, e.Node.UUID, id); err != nil || n != e.Node {
 			t.Errorf("node of %s by id = %+v, %v; want %+v", p, n, err, e.Node)
 		}

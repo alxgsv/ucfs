@@ -44,6 +44,12 @@ func (ix *Index) PutVariant(ctx context.Context, v Variant) error {
 
 // PutNodeOps records the operations path behind a node id, so a file handle
 // that carries only the id resolves after a restart.
+// ExpireVariant makes a variant's HEAD answer due for renewal.
+func (ix *Index) ExpireVariant(ctx context.Context, uuid, ops string) error {
+	_, err := ix.db.ExecContext(ctx, `UPDATE variants SET checked_at = 0 WHERE uuid = ? AND ops = ?`, uuid, ops)
+	return err
+}
+
 func (ix *Index) PutNodeOps(ctx context.Context, id uint64, uuid, ops string) error {
 	_, err := ix.db.ExecContext(ctx, `INSERT OR IGNORE INTO node_ops (id, uuid, ops) VALUES (?, ?, ?)`,
 		int64(id), uuid, ops)
@@ -56,6 +62,31 @@ func (ix *Index) NodeOps(ctx context.Context, id uint64) (uuid, ops string, err 
 		err = ErrNotFound
 	}
 	return uuid, ops, err
+}
+
+// NodeSalts returns the salts of node keys whose plain id collided.
+func (ix *Index) NodeSalts(ctx context.Context) (map[string]uint32, error) {
+	rows, err := ix.db.QueryContext(ctx, `SELECT key, salt FROM node_salts`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[string]uint32{}
+	for rows.Next() {
+		var key string
+		var salt uint32
+		if err := rows.Scan(&key, &salt); err != nil {
+			return nil, err
+		}
+		out[key] = salt
+	}
+	return out, rows.Err()
+}
+
+func (ix *Index) PutNodeSalt(ctx context.Context, key string, salt uint32) error {
+	_, err := ix.db.ExecContext(ctx, `INSERT INTO node_salts (key, salt) VALUES (?, ?)
+		ON CONFLICT (key) DO UPDATE SET salt = excluded.salt`, key, salt)
+	return err
 }
 
 // MoveNodePaths maps the ids recorded for a directory known by path, and for

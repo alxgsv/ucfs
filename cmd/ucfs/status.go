@@ -107,22 +107,48 @@ func printStatus(w io.Writer, st ctl.Status) error {
 	b := func(n int64) string { return humanize.IBytes(uint64(n)) }
 	syncState := "ok"
 	if st.Index.SyncError != "" {
-		syncState = st.Index.SyncError
+		syncState = fmt.Sprintf("%d syncs failed in a row, the last with: %s; next try in %s", st.Index.SyncFailures,
+			st.Index.SyncError, time.Until(st.Index.NextSync).Round(time.Second))
 	}
 	_, err := fmt.Fprintf(w, "%s  %s, %s, pid %d, up %s\n"+
 		"  index  %d files, %s; last sync %s ago (%s)\n"+
-		"  cdn    %d requests (%d HEAD, %d GET), %s (%d bytes)\n"+
+		"  cdn    %d requests (%d HEAD, %d GET), %s (%d bytes); %d of %d in flight, %d reads and %d prefetches waiting\n"+
 		"  cache  served %s, %s from disk; fetched %s on demand + %s prefetched; %s of %s used\n",
 		st.MountDir, st.Project, st.Frontend, st.PID, time.Since(st.Started).Round(time.Second),
 		st.Index.Files, b(st.Index.Bytes), time.Since(st.Index.LastSync).Round(time.Second), syncState,
 		st.CDN.Requests, st.CDN.Heads, st.CDN.Gets, b(st.CDN.Bytes), st.CDN.Bytes,
+		st.CDN.Inflight, st.CDN.MaxInflight, st.CDN.Queued, st.CDN.QueuedPrefetch,
 		b(st.Cache.Served), b(st.Cache.Hit), b(st.Cache.FetchedDemand), b(st.Cache.FetchedPrefetch),
 		b(st.Cache.Used), b(st.Cache.Max))
 	if err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(w, "  api    %d REST, %d Upload API, %d part PUTs, %d throttled\n",
-		st.API.REST, st.API.Upload, st.API.Parts, st.API.Throttled)
+	if bs := st.Budget; bs != nil {
+		state := ""
+		if bs.Refused > 0 {
+			state = fmt.Sprintf("; reached, %d reads refused with EDQUOT", bs.Refused)
+		} else if !bs.Prefetch {
+			state = "; prefetch stopped"
+		}
+		_, err = fmt.Fprintf(w, "  budget %s of %s used today, %s left; resets %s (in %s)%s\n",
+			b(bs.Used), b(bs.Limit), b(bs.Remaining), bs.ResetsAt.Format("Jan 2 15:04"),
+			time.Until(bs.ResetsAt).Round(time.Minute), state)
+		if err != nil {
+			return err
+		}
+	}
+	apiState := ""
+	switch st.API.State {
+	case "denied":
+		apiState = fmt.Sprintf("; API denied since %s: %s", st.API.Since.Local().Format(time.DateTime), st.API.Detail)
+	case "throttled":
+		apiState = fmt.Sprintf("; throttled since %s", st.API.Since.Local().Format(time.DateTime))
+	}
+	if st.API.Degraded {
+		apiState += " (serving the index; writes refused)"
+	}
+	_, err = fmt.Fprintf(w, "  api    %d REST, %d Upload API, %d part PUTs, %d throttled%s\n",
+		st.API.REST, st.API.Upload, st.API.Parts, st.API.Throttled, apiState)
 	if err != nil {
 		return err
 	}

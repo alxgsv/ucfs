@@ -193,15 +193,6 @@ func newID() string {
 	return hex.EncodeToString(b[:])
 }
 
-// ValidName reports whether a written name can be uploaded as is. A base
-// upload keeps only what follows the last backslash (Spike D).
-func ValidName(name string) error {
-	if strings.ContainsRune(name, '\\') {
-		return syscall.EINVAL
-	}
-	return nil
-}
-
 // TreePath is the ucfs:path value for a spool path under tree/, or "" for
 // a path elsewhere.
 func TreePath(p string) string {
@@ -216,9 +207,6 @@ func TreePath(p string) string {
 // root. o is the identity it keeps through upload and renames; replaces is
 // the uuid of the file it overwrites, if any.
 func (m *Manager) Create(ctx context.Context, p string, o index.Object, replaces string) (*Spool, error) {
-	if err := ValidName(path.Base(p)); err != nil {
-		return nil, err
-	}
 	m.mu.Lock()
 	old := m.byPath[p]
 	m.mu.Unlock()
@@ -563,9 +551,6 @@ func (m *Manager) Drop(ctx context.Context, s *Spool) error {
 // committed is uploaded again under its new name, so the name it is stored
 // with is the final one.
 func (m *Manager) Move(ctx context.Context, s *Spool, to, replaces string) error {
-	if err := ValidName(path.Base(to)); err != nil {
-		return err
-	}
 	if other := m.At(to); other != nil && other != s {
 		if err := m.Drop(ctx, other); err != nil {
 			return err

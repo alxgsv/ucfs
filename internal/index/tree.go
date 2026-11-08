@@ -14,6 +14,9 @@ import (
 const (
 	// TreePathKey is the metadata key that places a file in tree/.
 	TreePathKey = "ucfs:path"
+	// NameMetaKey holds a file's name when the uploaded filename could not:
+	// a base upload drops everything up to the last backslash.
+	NameMetaKey = "ucfs:name"
 	// MaxTreePath is the metadata value limit, counted in characters.
 	MaxTreePath = 512
 )

@@ -26,7 +26,7 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := newRootCmd().ExecuteContext(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, "ucfs:", err)
+		fmt.Fprintln(os.Stderr, "ucfs:", redact(err.Error()))
 		return 1
 	}
 	return 0
@@ -44,7 +44,7 @@ func newRootCmd() *cobra.Command {
 			if g.verbose {
 				level = slog.LevelDebug
 			}
-			slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+			slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level, ReplaceAttr: redactAttr})))
 		},
 	}
 	f := root.PersistentFlags()
@@ -55,6 +55,7 @@ func newRootCmd() *cobra.Command {
 	f.StringVar(&g.CDNBase, "cdn-base", "", "CDN base URL (env UPLOADCARE_CDN_BASE; default derived from the public key)")
 	f.StringVar(&g.CacheDir, "cache-dir", "", "cache directory (default <user cache dir>/ucfs/<public key>)")
 	f.BoolVarP(&g.verbose, "verbose", "v", false, "debug logging")
+	f.BoolVar(&g.InsecureConfig, "insecure-config", false, "use a config file that group or others can read")
 
 	root.AddCommand(newVersionCmd(), newIndexCmd(g), newMountCmd(g), newUmountCmd(g), newStatusCmd(g),
 		newResolveCmd(), newSpoolCmd(g))
@@ -62,5 +63,9 @@ func newRootCmd() *cobra.Command {
 }
 
 func (g *globalFlags) load() (*config.Config, error) {
-	return config.Load(g.Options)
+	cfg, err := config.Load(g.Options)
+	if err == nil {
+		hideKeys(cfg)
+	}
+	return cfg, err
 }

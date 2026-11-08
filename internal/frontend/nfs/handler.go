@@ -49,8 +49,10 @@ func newHandler(v *vfs.FS) *handler {
 	return &handler{fs: &billyFS{v: v, uid: uint32(os.Getuid()), gid: uint32(os.Getgid())}, listings: map[uint64]listing{}}
 }
 
+// Mount offers AUTH_UNIX only: offered AUTH_NULL, the macOS client sends no
+// uid, and FilterAccess could not tell its users apart.
 func (h *handler) Mount(context.Context, net.Conn, gonfs.MountRequest) (gonfs.MountStatus, billy.Filesystem, []gonfs.AuthFlavor) {
-	return gonfs.MountStatusOk, h.fs, []gonfs.AuthFlavor{gonfs.AuthFlavorNull}
+	return gonfs.MountStatusOk, h.fs, []gonfs.AuthFlavor{gonfs.AuthFlavorUnix}
 }
 
 // Change accepts mode, owner and time changes and ignores them: files are
@@ -78,16 +80,16 @@ func (h *handler) ToHandle(_ billy.Filesystem, p []string) []byte {
 		return nil
 	}
 	h.fs.v.Remember(ctx, e.Node)
-	return encodeHandle(e.Node)
+	return encodeHandle(h.fs.v, e.Node)
 }
 
-func encodeHandle(n vfs.Node) []byte {
+func encodeHandle(v *vfs.FS, n vfs.Node) []byte {
 	b := make([]byte, handleLen)
 	b[0], b[1] = handleVersion, byte(n.Kind)
 	if n.UUID != "" {
 		_, _ = hex.Decode(b[4:20], []byte(strings.ReplaceAll(n.UUID, "-", "")))
 	}
-	binary.BigEndian.PutUint64(b[20:], n.ID())
+	binary.BigEndian.PutUint64(b[20:], v.ID(n))
 	return b
 }
 
@@ -130,6 +132,16 @@ func (h *handler) FromHandle(b []byte) (billy.Filesystem, []string, error) {
 }
 
 func (h *handler) InvalidateHandle(billy.Filesystem, []byte) error { return nil }
+
+// FilterAccess grants nothing to callers other than the user the daemon
+// runs as and root, so other users of the machine cannot read the project
+// through the mount, as FUSE without allow_other keeps them out.
+func (h *handler) FilterAccess(uid uint32, known bool, mask uint32) uint32 {
+	if known && (uid == h.fs.uid || uid == 0) {
+		return mask
+	}
+	return 0
+}
 
 // HandleLimit is large because handles cost nothing to keep, and go-nfs caps
 // a READDIR reply at HandleLimit()/2 entries.
@@ -191,7 +203,7 @@ func (b *billyFS) info(e vfs.Entry) *fileInfo {
 	if e.Node.IsDir() {
 		nlink = 2
 	}
-	return &fileInfo{e: e, sys: &nfsfile.FileInfo{Nlink: nlink, UID: b.uid, GID: b.gid, Fileid: e.Node.ID()}}
+	return &fileInfo{e: e, sys: &nfsfile.FileInfo{Nlink: nlink, UID: b.uid, GID: b.gid, Fileid: b.v.ID(e.Node)}}
 }
 
 func (b *billyFS) Stat(name string) (os.FileInfo, error) {

@@ -3,6 +3,7 @@ package ctl
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -75,5 +76,30 @@ func TestRegistry(t *testing.T) {
 	unregister()
 	if _, ok := Lookup(reg, link); ok {
 		t.Error("record left after unregister")
+	}
+}
+
+// Asking for the status many times leaves no connection open, on either
+// side.
+func TestGetLeavesNoConnection(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "c.sock")
+	srv, err := Serve(sock, func() Status { return Status{} }, func() {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srv.Close() }()
+	if _, err := Get(sock); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	before := runtime.NumGoroutine()
+	for range 50 {
+		if _, err := Get(sock); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+	if after := runtime.NumGoroutine(); after > before+2 {
+		t.Fatalf("goroutines %d before 50 status requests, %d after", before, after)
 	}
 }

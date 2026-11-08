@@ -19,7 +19,7 @@ func mountArgs(port int, dir string, o MountOptions) []string {
 		fmt.Sprintf("port=%d", port), fmt.Sprintf("mountport=%d", port),
 		"vers=3", "tcp", "locallocks", "noresvport",
 		"rsize=1048576", "wsize=1048576", fmt.Sprintf("readahead=%d", o.ReadAhead),
-		"nfc", "soft", "intr", "acregmax=3600", "acdirmax=5",
+		"nfc", "soft", "intr", "acregmax=3600", "acdirmax=5", "nosuid", "nodev",
 	}
 	if !o.Browse {
 		opts = append(opts, "nobrowse")

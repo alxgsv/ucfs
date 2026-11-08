@@ -16,8 +16,58 @@ func newIndexCmd(g *globalFlags) *cobra.Command {
 		Use:   "index",
 		Short: "Manage the local file index",
 	}
-	cmd.AddCommand(newIndexSyncCmd(g))
+	cmd.AddCommand(newIndexSyncCmd(g), newIndexRefreshCmd(g))
 	return cmd
+}
+
+func newIndexRefreshCmd(g *globalFlags) *cobra.Command {
+	return &cobra.Command{
+		Use:   "refresh <uuid>...",
+		Short: "Read files' current info into the index",
+		Long: "Fetches each file's info, metadata and tags included, and stores it in the index, which listings\n" +
+			"do not do for changes other clients make to files already listed. A file the API no longer\n" +
+			"knows is marked removed. A running mount sees the result at once; it shares the index.",
+		Args: cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := g.load()
+			if err != nil {
+				return err
+			}
+			client, err := api.New(cfg, apiTransport)
+			if err != nil {
+				return err
+			}
+			ix, err := index.Open(cfg.IndexPath())
+			if err != nil {
+				return err
+			}
+			defer func() { _ = ix.Close() }()
+			ctx, out := cmd.Context(), cmd.OutOrStdout()
+			for _, uuid := range args {
+				f, err := client.Info(ctx, uuid)
+				switch {
+				case api.IsNotFound(err):
+					err = ix.MarkRemoved(ctx, uuid)
+					if err == nil {
+						_, err = fmt.Fprintf(out, "%s: not found, marked removed\n", uuid)
+					}
+				case err == nil && !f.RemovedAt.IsZero():
+					if err = ix.PutInfo(ctx, time.Now(), f); err == nil {
+						_, err = fmt.Fprintf(out, "%s: removed %s\n", uuid, f.RemovedAt.Local().Format(time.DateTime))
+					}
+				case err == nil:
+					if err = ix.PutInfo(ctx, time.Now(), f); err == nil {
+						_, err = fmt.Fprintf(out, "%s: %s, %s, %d metadata keys, tags %v\n", uuid, f.Name,
+							humanize.IBytes(uint64(f.Size)), len(f.Metadata), f.Tags)
+					}
+				}
+				if err != nil {
+					return fmt.Errorf("%s: %w", uuid, err)
+				}
+			}
+			return nil
+		},
+	}
 }
 
 func newIndexSyncCmd(g *globalFlags) *cobra.Command {
@@ -33,7 +83,7 @@ func newIndexSyncCmd(g *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			client, err := api.New(cfg, nil)
+			client, err := api.New(cfg, apiTransport)
 			if err != nil {
 				return err
 			}
