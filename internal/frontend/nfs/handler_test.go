@@ -128,12 +128,24 @@ func TestServeOverRPC(t *testing.T) {
 }
 
 func TestHandleRoundTrip(t *testing.T) {
-	env := vfstest.New(t, fake.File{UUID: uuid(42), Name: "hero.jpg", Size: 10, Uploaded: t0})
+	env := vfstest.New(t, fake.File{UUID: uuid(42), Name: "hero.jpg", Size: 10, Uploaded: t0, Tags: []string{"x"}})
+	group := env.Fake.AddGroup(t0, uuid(42))
+	opts := vfs.Options{Views: vfs.AllViews, DateZone: time.UTC, CDNBase: env.Fake.CDNBase(), Remote: env.Client}
+	env.FS.Configure(opts)
 	h := newHandler(env.FS)
 	// A second filesystem on the same index stands in for a restarted daemon.
-	restarted := newHandler(vfs.New(env.Index, env.Cache, env.CDN, nil))
+	fs2 := vfs.New(env.Index, env.Cache, env.CDN, nil)
+	fs2.Configure(opts)
+	restarted := newHandler(fs2)
 	ctx := context.Background()
 	for _, p := range []string{
+		"by-date",
+		"by-date/2026/03/04",
+		"by-date/2026/03/04/" + uuid(42) + "_hero.jpg",
+		"tags/x",
+		"tags/x/" + uuid(42) + "_hero.jpg",
+		"groups/" + group,
+		"groups/" + group + "/0_hero.jpg",
 		"",
 		"files",
 		"files/" + uuid(42) + "_hero.jpg",
@@ -426,5 +438,39 @@ func TestRenameBackupSaveOverRPC(t *testing.T) {
 		if strings.HasPrefix(e.FileName, ".nfs") || strings.HasSuffix(e.FileName, "~") {
 			t.Errorf("left over: %s", e.FileName)
 		}
+	}
+}
+
+func TestByDateOverRPC(t *testing.T) {
+	env := vfstest.New(t, fake.File{UUID: uuid(1), Name: "a.jpg", Size: 3<<20 + 1, Uploaded: t0},
+		fake.File{UUID: uuid(2), Name: "b.jpg", Size: 7, Uploaded: t0.AddDate(0, 0, 1)})
+	target := mount(t, env)
+	var dirs []string
+	for _, p := range []string{"/by-date", "/by-date/2026", "/by-date/2026/03"} {
+		entries, err := target.ReadDirPlus(p)
+		if err != nil {
+			t.Fatalf("readdir %s: %v", p, err)
+		}
+		var names []string
+		for _, e := range entries {
+			if e.FileName != "." && e.FileName != ".." {
+				names = append(names, e.FileName)
+			}
+		}
+		dirs = append(dirs, strings.Join(names, ","))
+	}
+	if want := []string{"2026", "03", "04,05"}; strings.Join(dirs, " ") != strings.Join(want, " ") {
+		t.Errorf("listings = %q, want %q", dirs, want)
+	}
+	if reqs, _ := env.Fake.CDNStats(); reqs != 0 {
+		t.Errorf("listing by-date made %d CDN requests", reqs)
+	}
+	f, err := target.Open("/by-date/2026/03/04/" + uuid(1) + "_a.jpg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	if got, err := io.ReadAll(f); err != nil || !bytes.Equal(got, fake.Content(uuid(1), 3<<20+1)) {
+		t.Errorf("read %d bytes, %v", len(got), err)
 	}
 }
