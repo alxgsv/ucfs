@@ -16,6 +16,12 @@ lint:
 	golangci-lint run ./...
 	GOOS=linux golangci-lint run ./...
 
+# Release archives, checksums and the Homebrew formula in dist/, built as a
+# tag would publish them, without uploading anything; see docs/release.md.
+.PHONY: snapshot
+snapshot:
+	goreleaser release --snapshot --clean --skip=publish
+
 run: build
 	./bin/ucfs $(ARGS)
 
