@@ -105,6 +105,15 @@ func (c *Client) ListFiles(ctx context.Context, o ListOptions, fn func(File) err
 	return nil
 }
 
+// Info fetches one file's current info.
+func (c *Client) Info(ctx context.Context, uuid string) (File, error) {
+	info, err := c.files.Info(ctx, uuid, nil)
+	if err != nil {
+		return File{}, err
+	}
+	return fromInfo(&info), nil
+}
+
 // AutostoreEnabled reports the project setting that decides whether uploads
 // are stored without an explicit store request.
 func (c *Client) AutostoreEnabled(ctx context.Context) (bool, error) {
