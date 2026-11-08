@@ -221,7 +221,7 @@ func (f *FS) Remember(ctx context.Context, n Node) {
 	if !n.Kind.ByPath() || n.Ops == "" || n.Ino != 0 {
 		return
 	}
-	id := n.ID()
+	id := f.ID(n)
 	f.mu.Lock()
 	_, known := f.nodeOps[id]
 	if !known {
@@ -277,12 +277,12 @@ func (f *FS) NodeByID(ctx context.Context, kind Kind, uuid string, id uint64) (N
 		if ok, err := f.dirExists(ctx, n); err != nil || !ok {
 			return Node{}, syscall.ESTALE
 		}
-		if n.ID() != id {
+		if f.ID(n) != id {
 			n.Ino = id
 		}
 		return n, nil
 	}
-	if n.ID() != id {
+	if f.ID(n) != id {
 		return Node{}, syscall.ESTALE
 	}
 	return n, nil

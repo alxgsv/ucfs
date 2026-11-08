@@ -31,6 +31,12 @@ status a procedure already chose and maps any other error. The mapping is applie
 - `nfs_onmkdir.go`: `MkdirAll` and the attributes applied
 - `nfs_oncommit.go`: `Commit` (below)
 
+ACCESS can be narrowed by the caller: `nfs_onaccess.go` adds the `AccessFilter` interface, which a handler implements to
+decide what ACCESS grants from the caller's AUTH_UNIX uid (stock go-nfs grants every bit asked for, whoever asks). NFS
+clients decide from the ACCESS answer whether a local user may open a file, so ucfs grants nothing to uids other than
+its own and root, which keeps other users of the machine out of the mount as FUSE does without `allow_other`. A raw RPC
+client can still claim any uid; AUTH_UNIX proves nothing.
+
 Two behaviours changed for ucfs writes:
 
 - **COMMIT reaches the filesystem.** `nfs_oncommit.go` adds the `Committer` interface. When the billy filesystem

@@ -10,8 +10,6 @@ import (
 	"github.com/alxgsv/ucfs/internal/api"
 )
 
-const keyGroupsCursor = "groups_cursor"
-
 // Group is a file group as the index knows it.
 type Group struct {
 	ID        string
@@ -27,23 +25,15 @@ type GroupLister interface {
 	ListGroups(ctx context.Context, from time.Time, fn func(api.Group) error) error
 }
 
-// SyncGroups lists the groups created since the stored cursor and records
-// them; their members are read when a group is first listed. Groups never
-// change, and deleted ones are dropped when their info answers 404.
+// SyncGroups lists every group the API knows, records the new ones, whose
+// members are read when a group is first listed, and drops the ones it no
+// longer lists: the API lists no deleted group. It costs one request per
+// thousand groups. It returns how many groups were added and dropped.
 func (ix *Index) SyncGroups(ctx context.Context, l GroupLister) (int, error) {
-	var from time.Time
-	var v string
-	err := ix.db.QueryRowContext(ctx, `SELECT value FROM sync_state WHERE key = ?`, keyGroupsCursor).Scan(&v)
-	switch {
-	case err == nil:
-		if from, err = time.Parse(time.RFC3339Nano, v); err != nil {
-			return 0, err
-		}
-	case !errors.Is(err, sql.ErrNoRows):
-		return 0, err
-	}
+	listed := map[string]bool{}
 	added := 0
-	err = l.ListGroups(ctx, from, func(g api.Group) error {
+	err := l.ListGroups(ctx, time.Time{}, func(g api.Group) error {
+		listed[g.ID] = true
 		res, err := ix.db.ExecContext(ctx, `INSERT INTO groups (uuid, created_at) VALUES (?, ?) ON CONFLICT (uuid) DO NOTHING`,
 			g.ID, g.CreatedAt.UnixNano())
 		if err != nil {
@@ -51,12 +41,26 @@ func (ix *Index) SyncGroups(ctx context.Context, l GroupLister) (int, error) {
 		}
 		n, err := res.RowsAffected()
 		added += int(n)
-		if err != nil {
-			return err
-		}
-		return ix.setState(ctx, ix.db, keyGroupsCursor, g.CreatedAt.UTC().Format(time.RFC3339Nano))
+		return err
 	})
-	return added, err
+	if err != nil {
+		return added, err
+	}
+	known, err := ix.Groups(ctx)
+	if err != nil {
+		return added, err
+	}
+	dropped := 0
+	for _, g := range known {
+		if listed[g.ID] {
+			continue
+		}
+		if err := ix.DeleteGroup(ctx, g.ID); err != nil {
+			return added + dropped, err
+		}
+		dropped++
+	}
+	return added + dropped, nil
 }
 
 func scanGroup(s interface{ Scan(...any) error }) (Group, error) {

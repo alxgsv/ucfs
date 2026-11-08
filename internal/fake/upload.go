@@ -387,3 +387,16 @@ func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
 }
+
+// Files returns the project's files that are not removed.
+func (s *Server) Files() []File {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []File
+	for _, f := range s.files {
+		if !f.Removed {
+			out = append(out, f)
+		}
+	}
+	return out
+}

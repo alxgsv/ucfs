@@ -7,7 +7,6 @@ package vfs
 import (
 	"context"
 	"errors"
-	"hash/fnv"
 	"io"
 	"log/slog"
 	"os"
@@ -106,50 +105,51 @@ type Node struct {
 	Ino uint64
 }
 
-// ID is the node's stable 64-bit identity, used as inode and NFS file id.
-func (n Node) ID() uint64 {
-	h := fnv.New64a()
+// idKey is what a node's id is a hash of, or "" for a node whose id is an
+// object's inode number (tree and shadow files, and a tree or shadow
+// directory rebuilt from a handle handed out before it was renamed).
+func (n Node) idKey() string {
 	switch n.Kind {
 	case KindRoot:
-		_, _ = h.Write([]byte("root"))
+		return "root"
 	case KindFilesDir:
-		_, _ = h.Write([]byte("files"))
+		return "files"
 	case KindFile:
-		_, _ = h.Write([]byte("files\x00" + n.UUID + "\x00"))
+		return "files\x00" + n.UUID + "\x00"
 	case KindFileDir:
-		_, _ = h.Write([]byte("files\x00" + n.UUID + "\x00/"))
+		return "files\x00" + n.UUID + "\x00/"
 	case KindVariantDir:
-		_, _ = h.Write([]byte("files\x00" + n.UUID + "\x00" + n.Ops))
+		return "files\x00" + n.UUID + "\x00" + n.Ops
 	case KindVariant:
-		_, _ = h.Write([]byte("files\x00" + n.UUID + "\x00" + n.Ops + "\x00"))
+		return "files\x00" + n.UUID + "\x00" + n.Ops + "\x00"
 	case KindTreeFile, KindShadow:
-		return n.Ino
+		return ""
 	case KindTreeDir:
 		if n.Ino != 0 {
-			return n.Ino
+			return ""
 		}
-		_, _ = h.Write([]byte("tree\x00" + n.Ops))
+		return "tree\x00" + n.Ops
 	case KindInbox:
-		_, _ = h.Write([]byte("tree\x00" + InboxDir))
+		return "tree\x00" + InboxDir
 	case KindShadowDir:
 		if n.Ino != 0 {
-			return n.Ino
+			return ""
 		}
-		_, _ = h.Write([]byte("shadow\x00" + n.Ops))
+		return "shadow\x00" + n.Ops
 	case KindUcfsDir:
-		_, _ = h.Write([]byte(UcfsDir))
+		return UcfsDir
 	case KindJournal:
-		_, _ = h.Write([]byte(UcfsDir + "/" + JournalName))
+		return UcfsDir + "/" + JournalName
 	case KindNeverIndex:
-		_, _ = h.Write([]byte(NeverIndex))
+		return NeverIndex
 	case KindViewDir:
-		_, _ = h.Write([]byte("view\x00" + n.Ops))
+		return "view\x00" + n.Ops
 	case KindDateFile:
-		_, _ = h.Write([]byte(ViewByDate + "\x00" + n.UUID))
+		return ViewByDate + "\x00" + n.UUID
 	case KindViewFile:
-		_, _ = h.Write([]byte("view\x00" + n.Ops + "\x00" + n.UUID))
+		return "view\x00" + n.Ops + "\x00" + n.UUID
 	}
-	return h.Sum64()
+	return ""
 }
 
 func (n Node) IsDir() bool {
@@ -213,6 +213,7 @@ type FS struct {
 	failed map[string]failure
 	// nodeOps holds the operations paths of node ids already in the index.
 	nodeOps map[uint64]string
+	ids     idTable
 
 	views map[string]bool
 	opts  Options
@@ -227,6 +228,7 @@ type FS struct {
 func New(ix *index.Index, c *cache.Cache, head Header, missing func(uuid string)) *FS {
 	f := &FS{ix: ix, cache: c, cdn: head, now: time.Now, missing: missing,
 		failed: map[string]failure{}, nodeOps: map[uint64]string{}}
+	f.ids.load(ix)
 	f.Configure(Options{})
 	f.Touch()
 	return f

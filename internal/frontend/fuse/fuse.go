@@ -57,10 +57,10 @@ func (n *node) cur() vfs.Node {
 }
 
 func (n *node) child(ctx context.Context, e vfs.Entry, out *gofuse.EntryOut) *gofs.Inode {
-	fillAttr(&out.Attr, e.Node, e.Attr)
+	fillAttr(&out.Attr, n.v, e.Node, e.Attr)
 	out.SetEntryTimeout(e.Attr.TTL)
 	out.SetAttrTimeout(e.Attr.TTL)
-	return n.NewInode(ctx, &node{v: n.v, n: e.Node}, gofs.StableAttr{Mode: typeBits(e.Node), Ino: e.Node.ID()})
+	return n.NewInode(ctx, &node{v: n.v, n: e.Node}, gofs.StableAttr{Mode: typeBits(e.Node), Ino: n.v.ID(e.Node)})
 }
 
 func errno(err error) syscall.Errno {
@@ -78,8 +78,8 @@ func typeBits(n vfs.Node) uint32 {
 	return syscall.S_IFREG
 }
 
-func fillAttr(out *gofuse.Attr, n vfs.Node, a vfs.Attr) {
-	out.Ino = n.ID()
+func fillAttr(out *gofuse.Attr, v *vfs.FS, n vfs.Node, a vfs.Attr) {
+	out.Ino = v.ID(n)
 	out.Mode = typeBits(n) | uint32(a.Mode.Perm())
 	out.Size = uint64(a.Size)
 	out.Blocks = (out.Size + 511) / 512
@@ -97,7 +97,7 @@ func (n *node) Getattr(ctx context.Context, _ gofs.FileHandle, out *gofuse.AttrO
 	if err != nil {
 		return errno(err)
 	}
-	fillAttr(&out.Attr, cur, a)
+	fillAttr(&out.Attr, n.v, cur, a)
 	out.SetTimeout(a.TTL)
 	return 0
 }
@@ -117,7 +117,7 @@ func (n *node) Readdir(ctx context.Context) (gofs.DirStream, syscall.Errno) {
 	}
 	out := make([]gofuse.DirEntry, len(entries))
 	for i, e := range entries {
-		out[i] = gofuse.DirEntry{Name: e.Name, Ino: e.Node.ID(), Mode: typeBits(e.Node)}
+		out[i] = gofuse.DirEntry{Name: e.Name, Ino: n.v.ID(e.Node), Mode: typeBits(e.Node)}
 	}
 	return gofs.NewListDirStream(out), 0
 }
@@ -291,7 +291,9 @@ const maxIO = 1 << 20
 func Mount(dir string, v *vfs.FS, debug bool) (*gofuse.Server, error) {
 	negative := time.Second
 	root := &node{v: v, n: v.Root()}
-	opts := []string{"noatime"}
+	// fusermount3 adds nosuid and nodev for a user anyway; go-fuse turns
+	// them into mount flags for a direct mount(2), as root in a VM does.
+	opts := []string{"noatime", "nosuid", "nodev"}
 	if !v.Writable() {
 		opts = append(opts, "ro")
 	}

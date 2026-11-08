@@ -126,7 +126,7 @@ func withSpools(ctx context.Context, g *globalFlags, mountDir string, live func(
 		return err
 	}
 	defer unlock()
-	client, err := api.New(cfg, nil)
+	client, err := api.New(cfg, apiTransport)
 	if err != nil {
 		return err
 	}

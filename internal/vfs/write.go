@@ -158,12 +158,9 @@ func join(dir, name string) string {
 	return dir + "/" + name
 }
 
-// checkTreeName rejects names a file in tree/ cannot be uploaded with or
-// whose ucfs:path would not fit in a metadata value.
+// checkTreeName rejects names whose ucfs:path would not fit in a metadata
+// value.
 func checkTreeName(dir, name string) error {
-	if err := spool.ValidName(name); err != nil {
-		return err
-	}
 	if utf8.RuneCountInString(treeChild(dir, name)) > index.MaxTreePath {
 		return syscall.ENAMETOOLONG
 	}
@@ -199,9 +196,6 @@ func (f *FS) Create(ctx context.Context, dir Node, name string) (Entry, error) {
 	case KindFilesDir:
 		if _, _, isUUID := parseName(name); isUUID {
 			return Entry{}, syscall.EROFS
-		}
-		if err := spool.ValidName(name); err != nil {
-			return Entry{}, err
 		}
 	case KindTreeDir:
 		if dir.Ops == "/" && name == InboxDir {
@@ -845,9 +839,6 @@ func (f *FS) renameShadow(ctx context.Context, from string, src Entry, to string
 			return err
 		}
 	case KindFilesDir:
-		if err := spool.ValidName(newName); err != nil {
-			return err
-		}
 	default:
 		return syscall.EXDEV
 	}

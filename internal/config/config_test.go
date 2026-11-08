@@ -115,3 +115,33 @@ func TestLoadCacheDir(t *testing.T) {
 		t.Errorf("cache dir = %q, want %q", cfg.CacheDir, want)
 	}
 }
+
+// A config file others may read is refused with the fix in the message,
+// unless InsecureConfig says to use it anyway.
+func TestInsecureConfigRefused(t *testing.T) {
+	clearEnv(t)
+	p := writeConfig(t, sample)
+	if err := os.Chmod(p, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(Options{ConfigPath: p})
+	if !errors.Is(err, ErrInsecureConfig) || !strings.Contains(err.Error(), "chmod 600 "+p) || !strings.Contains(err.Error(), "0644") {
+		t.Fatalf("0644 config: %v", err)
+	}
+	if err := os.Chmod(p, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(Options{ConfigPath: p}); !errors.Is(err, ErrInsecureConfig) {
+		t.Fatalf("0640 config: %v", err)
+	}
+	cfg, err := Load(Options{ConfigPath: p, InsecureConfig: true})
+	if err != nil || cfg.PublicKey != "apub" {
+		t.Fatalf("--insecure-config: %+v, %v", cfg, err)
+	}
+	if err := os.Chmod(p, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(Options{ConfigPath: p}); err != nil {
+		t.Fatalf("0600 config: %v", err)
+	}
+}

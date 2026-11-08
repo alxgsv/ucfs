@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -41,6 +42,10 @@ type mountFlags struct {
 	maxInflight   int
 	writeFlags
 }
+
+// apiTransport carries REST and Upload API requests; nil is the default
+// transport, and tests point it at internal/fake.
+var apiTransport http.RoundTripper
 
 // mounted is a filesystem attached by one of the front-ends.
 type mounted interface {
@@ -147,7 +152,17 @@ func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) er
 	if err != nil {
 		return err
 	}
-	client, err := api.New(cfg, nil)
+	for _, d := range []string{cfg.CacheDir, filepath.Join(cfg.CacheDir, "blocks"), filepath.Join(cfg.CacheDir, "spool"),
+		filepath.Join(cfg.CacheDir, "shadow")} {
+		fixed, err := ctl.PrivateDir(d)
+		if err != nil {
+			return err
+		}
+		if fixed {
+			slog.Warn("made a cache directory private to this user", "dir", d, "mode", "0700")
+		}
+	}
+	client, err := api.New(cfg, apiTransport)
 	if err != nil {
 		return err
 	}

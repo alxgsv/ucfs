@@ -64,6 +64,31 @@ func (ix *Index) NodeOps(ctx context.Context, id uint64) (uuid, ops string, err 
 	return uuid, ops, err
 }
 
+// NodeSalts returns the salts of node keys whose plain id collided.
+func (ix *Index) NodeSalts(ctx context.Context) (map[string]uint32, error) {
+	rows, err := ix.db.QueryContext(ctx, `SELECT key, salt FROM node_salts`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[string]uint32{}
+	for rows.Next() {
+		var key string
+		var salt uint32
+		if err := rows.Scan(&key, &salt); err != nil {
+			return nil, err
+		}
+		out[key] = salt
+	}
+	return out, rows.Err()
+}
+
+func (ix *Index) PutNodeSalt(ctx context.Context, key string, salt uint32) error {
+	_, err := ix.db.ExecContext(ctx, `INSERT INTO node_salts (key, salt) VALUES (?, ?)
+		ON CONFLICT (key) DO UPDATE SET salt = excluded.salt`, key, salt)
+	return err
+}
+
 // MoveNodePaths maps the ids recorded for a directory known by path, and for
 // those below it, to the directory's new path. Only rows without a uuid,
 // which tree and shadow directories leave, are paths.

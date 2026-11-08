@@ -10,11 +10,13 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -155,14 +157,20 @@ func hash32(s string) uint32 {
 }
 
 // SocketPath is the control socket of a mount: in the project's cache dir,
-// named after the mount point, or under the temp dir when that path would
-// not fit in sun_path.
+// named after the mount point, or in a directory of the user's under the
+// temp dir when that path would not fit in sun_path.
 func SocketPath(cacheDir, mountDir string) string {
 	p := filepath.Join(cacheDir, fmt.Sprintf("ctl-%08x.sock", hash32(mountDir)))
 	if len(p) <= maxSocketPath {
 		return p
 	}
-	return filepath.Join(os.TempDir(), fmt.Sprintf("ucfs-%08x-%08x.sock", hash32(cacheDir), hash32(mountDir)))
+	return filepath.Join(tempSocketDir(), fmt.Sprintf("%08x-%08x.sock", hash32(cacheDir), hash32(mountDir)))
+}
+
+// tempSocketDir is where sockets go that do not fit in the cache dir. It
+// is the user's own, since the temp dir is shared on Linux.
+func tempSocketDir() string {
+	return filepath.Join(os.TempDir(), fmt.Sprintf("ucfs-%d", os.Getuid()))
 }
 
 // Sockets lists the control sockets of mounts that use a cache dir.
@@ -171,8 +179,33 @@ func Sockets(cacheDir string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	inTemp, err := filepath.Glob(filepath.Join(os.TempDir(), fmt.Sprintf("ucfs-%08x-*.sock", hash32(cacheDir))))
+	inTemp, err := filepath.Glob(filepath.Join(tempSocketDir(), fmt.Sprintf("%08x-*.sock", hash32(cacheDir))))
 	return append(inCache, inTemp...), err
+}
+
+// PrivateDir makes dir, or fixes it to mode 0700 if it exists with another
+// mode, and reports whether it had to fix it. A dir that is a symlink or
+// another user's is an error: someone else could read what goes in it.
+func PrivateDir(dir string) (fixed bool, err error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return false, err
+	}
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return false, err
+	}
+	if !fi.IsDir() || !ownedByUs(fi) {
+		return false, fmt.Errorf("%s is not a directory of this user's", dir)
+	}
+	if fi.Mode().Perm() == 0o700 {
+		return false, nil
+	}
+	return true, os.Chmod(dir, 0o700)
+}
+
+func ownedByUs(fi fs.FileInfo) bool {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	return ok && int(st.Uid) == os.Getuid()
 }
 
 type Server struct {
@@ -191,6 +224,9 @@ type Route struct {
 func Serve(path string, status func() Status, unmount func(), routes ...Route) (*Server, error) {
 	if _, err := Get(path); err == nil {
 		return nil, fmt.Errorf("a ucfs daemon already serves %s", path)
+	}
+	if _, err := PrivateDir(filepath.Dir(path)); err != nil {
+		return nil, err
 	}
 	_ = os.Remove(path)
 	l, err := net.Listen("unix", path)

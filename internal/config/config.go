@@ -18,6 +18,7 @@ import (
 var (
 	ErrNoCredentials   = errors.New("no project credentials found")
 	ErrProjectNotFound = errors.New("project not found in config")
+	ErrInsecureConfig  = errors.New("config file is readable by group or others")
 )
 
 // Options carries values from command-line flags; empty fields are unset.
@@ -28,6 +29,9 @@ type Options struct {
 	SecretKey  string
 	CDNBase    string
 	CacheDir   string
+	// InsecureConfig reads a config file that group or others may read,
+	// which Load refuses otherwise: it holds secret keys.
+	InsecureConfig bool
 }
 
 // Config is the resolved configuration of one mounted project.
@@ -70,7 +74,7 @@ func Load(o Options) (*Config, error) {
 	if path == "" {
 		path = DefaultPath()
 	}
-	f, err := readFile(path)
+	f, err := readFile(path, o.InsecureConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -120,13 +124,21 @@ func Load(o Options) (*Config, error) {
 // IndexPath is the SQLite index file inside the cache directory.
 func (c *Config) IndexPath() string { return filepath.Join(c.CacheDir, "index.db") }
 
-func readFile(path string) (*file, error) {
+func readFile(path string, insecure bool) (*file, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return &file{}, nil
 	}
 	if err != nil {
 		return nil, err
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if perm := fi.Mode().Perm(); perm&0o077 != 0 && !insecure {
+		return nil, fmt.Errorf("%w: %s has mode %04o; run chmod 600 %s, or pass --insecure-config to use it anyway",
+			ErrInsecureConfig, path, perm, path)
 	}
 	var f file
 	if err := yaml.Unmarshal(data, &f); err != nil {

@@ -387,14 +387,17 @@ func (s *Server) groupInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, out)
 }
 
-func (s *Server) deleteGroup(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+// DeleteGroup deletes a group as another client would.
+func (s *Server) DeleteGroup(id string) bool {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	n := len(s.groups)
 	s.groups = slices.DeleteFunc(s.groups, func(g Group) bool { return g.ID == id })
-	gone := n != len(s.groups)
-	s.mu.Unlock()
-	if !gone {
+	return n != len(s.groups)
+}
+
+func (s *Server) deleteGroup(w http.ResponseWriter, r *http.Request) {
+	if !s.DeleteGroup(r.PathValue("id")) {
 		detail(w, http.StatusNotFound, "Not found.")
 		return
 	}
