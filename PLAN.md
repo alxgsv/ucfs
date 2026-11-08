@@ -24,7 +24,7 @@ Decisions fixed up front:
 |---|---|---|
 | Language, toolchain | Go 1.26, `CGO_ENABLED=0` | Matches `uploadcare-go` and `uploadcare-cli`; static binaries; cross-compile for darwin/linux from one machine |
 | Repository and module path | `github.com/alxgsv/ucfs`, private for now, checkout `~/workspace/ucfs` | Personal repo while experimental; the module path equals the repo path, so going public needs no rename. A later move to the `uploadcare` org is a module-path change in `go.mod` and imports, nothing structural |
-| macOS front-end | Loopback NFSv3 server (`github.com/willscott/go-nfs` at master `c092ae79c64e` for `Server.ConcurrentHandlers`, which v0.0.4 lacks; carried in `third_party/go-nfs` since Phase 2 with a patch that passes errnos through as NFS statuses, and since Phase 3 one that passes COMMIT to the filesystem) mounted with the built-in `mount_nfs` as the user, no `sudo` (Spike A) | Zero install, no kext, works on managed Macs. Proven by rclone `nfsmount` |
+| macOS front-end | Loopback NFSv3 server (`github.com/willscott/go-nfs` at master `c092ae79c64e` for `Server.ConcurrentHandlers`, which v0.0.4 lacks; carried in `third_party/go-nfs` since Phase 2 with a patch that passes errnos through as NFS statuses, since Phase 3 one that passes COMMIT to the filesystem, and since Phase 5 one that lets the handler narrow ACCESS by the caller's uid) mounted with the built-in `mount_nfs` as the user, no `sudo` (Spike A) | Zero install, no kext, works on managed Macs. Proven by rclone `nfsmount` |
 | Linux front-end | FUSE via `github.com/hanwen/go-fuse/v2` (pure Go) | No libfuse dependency, full semantics (close, xattrs, invalidation). NFS front-end also builds on Linux as a fallback |
 | Index | SQLite via `modernc.org/sqlite` | Pure Go; WAL gives concurrent readers; survives restarts |
 | API client | `github.com/uploadcare/uploadcare-go/v2` (`file`, `upload`, `metadata`, `tag`, `group`, `project`) with `RetryConfig` enabled | Already covers list, search, info, store/delete, local copy, base and multipart upload, metadata, tags, groups |
@@ -51,7 +51,8 @@ internal/fake/                 httptest doubles for REST, Upload API and CDN use
 third_party/go-nfs/            go-nfs at the pinned commit with the errno, COMMIT and exclusive-create patches (README.ucfs.md), wired in by a go.mod replace
 testdata/                      golden files, fixtures
 docs/                          mount options, troubleshooting, Finder notes
-Makefile  .goreleaser.yaml  .github/workflows/ci.yml  CLAUDE.md  AGENTS.md
+spikes/                        measurement tools: photogen, rest, keygrep (keys in logs), benchtable (benchmark tables), measure/*.sh
+Makefile  .github/workflows/ci.yml (Phase 5)  .goreleaser.yaml  CLAUDE.md  AGENTS.md (Phase 6)
 ```
 
 ## 3. Phases
@@ -140,8 +141,9 @@ mount whatever `--cache-dir` it was started with.
     (`ucfs:path`). Files up to 10 MiB go as one base upload, larger ones in 5 MiB parts, 4 at a time
     (`--multipart-threshold`; 10 MiB is the Upload API's multipart minimum and what uploadcare-go and the CLI use).
     `internal/api` calls `/base/` and `/multipart/start|complete/` itself, so a multipart upload's uuid is known at
-    its start. Up to 8 uploads run at once (`--upload-concurrency`). Names containing `\` fail with `EINVAL`, since
-    base upload keeps only what follows the last `\` (Spike D), until the `ucfs:name` fallback exists. Errors:
+    its start. Up to 8 uploads run at once (`--upload-concurrency`). A base upload keeps only what follows the last `\` of a
+    name (Spike D), so since Phase 5 a name containing `\` goes up with underscores and whole in metadata `ucfs:name`,
+    which the index shows as the file's name in every view (it was `EINVAL` before). Errors:
     "Uploading of these file types is not allowed" (`uploadcare-go-test` rejects a random binary) is `EPERM`, a too
     large file `EFBIG`, a 429 after the Retry-After retries `EAGAIN` (NFS3ERR_JUKEBOX over NFS), network errors and
     5xx `EIO` after three tries. A finished upload is recorded in the index without moving the sync cursor (its time
@@ -158,7 +160,9 @@ mount whatever `--cache-dir` it was started with.
 23. `tree/` (`internal/vfs/tree.go`): `tree/<path>/<name>` from metadata key `ucfs:path`, whose value is the
     absolute path under `tree/`, name included, as written (NFC from macOS), at most 512 characters
     (`ENAMETOOLONG` beyond). The name comes from the path, not `original_filename`, so `rename` of an uploaded file is
-    one metadata `PUT`; a directory rename is one `PUT` per file below it, with a warning above 1000. Files that share
+    one metadata `PUT`; a directory rename is one `PUT` per file below it, with a warning above 1000. It is not
+    atomic: if a `PUT` fails, the files moved so far are under the new path and the rest under the old, and `mv`
+    gets the error; `mv old/* new/` completes it (journaling it was not worth it at one request per file). Files that share
     a path are told apart by a uuid suffix (`photo~1a2b3c4d.jpg`), the newest keeping the plain name. Files without a
     valid `ucfs:path` appear under `tree/_inbox/` by original name, with the same suffix rule. A directory exists
     while a file below it has a tree path; `mkdir`, and `rm` or `mv` of a directory's last file, keep it in
@@ -233,10 +237,11 @@ upload resumed and the file arrived once on both hosts; a 12.2 MB file went up i
     file in the index carries (`json_each` over the `tags` column; `.` and `..` skipped); `groups/<id>/<index>_<name>`,
     where `<id>` is the group id `<uuid>~<count>` and the index counts from 0 as the CDN's `/nth/` does, zero-padded to
     the width of the last index so `ls` order is group order, keeping gaps for removed members. Group sync lists
-    `GET /groups/` from a cursor with every sweep (`--sweep-interval`, 10 min) when the view is mounted; a group's
+    every group (`GET /groups/`, one request per thousand) with every sweep (`--sweep-interval`, 10 min) when the
+    view is mounted, and since Phase 5 drops the groups it no longer lists; a group's
     members come from `GET /groups/{id}/` on its first listing (uploadcare-go's `group.Info` has no files, so the client
     sends that request itself) and are kept, since groups never change; a group id not synced yet is read on lookup, and
-    a 404 drops it. A deleted group whose members were already read stays listed: the API lists no deleted groups. View nodes have NFS handles like variants: directories and `tags/`/`groups/` files by path through
+    a 404 drops it. The API lists no deleted groups, which is how a deleted group leaves `groups/` within a sweep. View nodes have NFS handles like variants: directories and `tags/`/`groups/` files by path through
     `node_ops`, `by-date/` files by uuid alone.
 30. `ucfs resolve <path> [--json]` prints metadata and tags too, plus the CDN URL (uuid, CDN URL and pending state came
     in Phase 3); for a pending upload it shows what was queued on it. It refreshes info older than `--meta-ttl` like an
@@ -262,19 +267,58 @@ the read-only attributes; both are fixed.
 
 ### Phase 5: Hardening (≈ 3 days)
 
-33. Traffic budget `--traffic-budget` (bytes per day); reads beyond it fail with `EDQUOT` and `ucfs status` says so.
-34. Error → errno table applied everywhere: 404 `ENOENT`, 401/403 `EACCES`, 429 after retries `EAGAIN`, 5xx/network
-    `EIO`, unsupported `EOPNOTSUPP`/`EROFS`, bad variant `EINVAL` (done in Phase 2; NFS carries errnos through the
-    patched go-nfs, and NFSv3 has no status for `EAGAIN`, so 429 needs `NFS3ERR_JUKEBOX` there). Check the ETag of every
-    variant 206 against the recorded one and fail the read on a mismatch (§4.4).
-35. Backpressure: bounded in-flight CDN requests per mount (default 32) with a fair queue, so a bulk `rsync` cannot
-    starve interactive `stat`/`readdir`.
-36. Security defaults: `nosuid,nodev`, no `allow_other`, config file permission check, secrets never logged, cache dir
-    `0700`.
-37. Benchmarks in CI: cold `cat` 5 MB, `ls -l` 10 000 entries, two concurrent variant readers (p95 of the second
-    reader unchanged by the first).
-38. Soak: 24 h mount with Finder open and a sync loop running against the test project; no growth in goroutines,
-    file descriptors or cache beyond the configured size.
+33. Traffic budget `--traffic-budget` (`500MB`, `2GiB`, `500MB/day`) caps the CDN bytes read per calendar day in the
+    local zone (`cache.Budget`). Only range bodies count: `HEAD`s carry none and keep working, REST requests are not CDN
+    traffic, and the CDN's 1 KiB error pages are left out. A block is counted before it is fetched and given back if
+    the fetch fails, so the count never passes the limit; prefetch stops while less than a reserve remains (a tenth of
+    the budget, at most 16 MiB), which keeps the last bytes for reads someone waits for. The count lives in the index,
+    flushed every 5 s, so a remount continues the day and mounts of one project share it. A read past it fails with
+    `EDQUOT` ("Disc quota exceeded" on macOS through `NFS3ERR_DQUOT`); the log says so once per window and `ucfs status`
+    shows used, remaining, the reset time and reads refused. Linux 7.x reports a failed buffered FUSE read as `EIO`, so
+    a file larger than what is left is opened with direct I/O, where the reader gets `EDQUOT`.
+34. One errno table (`internal/api/errno.go`) for REST, Upload API and CDN failures, the CDN client returning typed
+    errors: 404 `ENOENT`; 401, 403 `EACCES`; 429 after the Retry-After retries `EAGAIN` (`NFS3ERR_JUKEBOX` over NFS,
+    which macOS retries for 28 s before `ETIMEDOUT`); 5xx, network errors and a changed ETag `EIO`; a CDN 400 `EINVAL`;
+    errnos the filesystem returns (`EROFS`, `EOPNOTSUPP`, `EDQUOT`) pass through. REST requests are bounded at 4 in
+    flight. The client keeps the REST state (ok, denied, throttled, since when); denied or throttled for a sync
+    interval, the mount is degraded: it serves the index and the block cache, skips info refreshes, and refuses what
+    needs the API (new spools, `rm`, `mv`, metadata and tags of uploaded files) with `EACCES` or `EAGAIN`; `ucfs status`
+    says `API denied since <time>` or `throttled since <time>`. Failed syncs back off, doubling up to 10 minutes, with
+    one warning per streak. A mount whose index was synced once starts without the API. Every range's ETag is compared
+    with its object's (weakly, RFC 9110); on a mismatch the object's blocks go and the read fails with `EIO`, and so does
+    a read that continues a stream begun before a content change (§4.4).
+35. Backpressure: `--max-inflight` (32) CDN requests per mount (`cdn.Limiter`). Reads someone waits for and `HEAD`s go
+    before prefetches, prefetches hold at most three quarters of the slots, and within each class objects take turns;
+    a queued prefetch costs no goroutine and joins a fetch only once it has its slot. `FetchTimeout` starts at the slot.
+36. Security defaults: a config file group or others can read is refused (`--insecure-config` overrides); cache,
+    blocks, spool and shadow dirs 0700 (fixed at mount), index files and the control socket 0600, sockets that do not
+    fit in the cache dir in a per-user 0700 temp dir; `nosuid,nodev` on every mount, no `allow_other`; key values are
+    replaced in logs and error messages. The NFS server offers only `AUTH_UNIX` and grants ACCESS only to its own uid and
+    root, so other users cannot read through the mount; the loopback NFS port itself is open to any local process
+    (docs/phase5.md, *Security*). Node ids are checked for collisions where they are handed out and salted (§4.3).
+37. Benchmarks against the fake (`make bench`, a Markdown table from `spikes/benchtable`): cold `cat` of 5 MB,
+    `ls -l` of 10,000 entries, variant readers and small reads beside bulk ones (p95 alone and beside). CI
+    (`.github/workflows/ci.yml`): lint for linux and darwin, build, `make race` with FUSE mounted on `ubuntu-latest`,
+    and the benchmarks with their table, compared with the previous run's, in the job summary. Nothing needs the
+    project's keys.
+38. Soak (`make soak`, `SOAK=24h`): a real mount of a fake project syncing every second, with uploads and deletes
+    through the mount, other clients adding, removing and changing files and groups, and readers of originals and
+    variants, sampled into a CSV (goroutines, descriptors, heap, RSS, cache, index); `UCFS_SOAK_LIVE=<project>` runs it
+    against a real project, `tree/` only.
+
+Acceptance: a `cat` that crosses the budget fails with "Disc quota exceeded"; a mount started while REST answers 403
+serves `ls` and cached reads and reports the denial; a changed ETag never returns mixed bytes; a small read beside bulk
+readers keeps its p95; a 0644 config is refused; no key in the logs; benchmarks in CI; no growth in a soak.
+Measured in [docs/phase5.md](docs/phase5.md): the budget `cat` fails after exactly 2 MiB on macOS live ("Disc quota
+exceeded") and Linux FUSE live ("Disk quota exceeded"); the denied mount lists, reads, refuses writes with EACCES and
+says so on macOS NFS, Linux FUSE and Linux NFS (fake); p95 of a cold 64 KiB read 37 ms alone and 34 ms beside four bulk
+readers, 304 ms with a plain bound (fake), 420 and 727 ms live, where no read waited for a slot and the downlink was
+shared; 0 key hits in the live debug logs. Soaks of 3 hours against the fake (macOS NFS and Linux FUSE, about
+160,000 operations and 5,300 uploads each) and 2 hours live kept goroutines and descriptors flat and the cache at its
+limit; the index grows with churn, keeping removed files' rows; RSS rose from 86 to 108 MiB on macOS with a flat Go
+heap, and the Linux heap from 46 to 80 MiB, mostly go-fuse nodes for entries the kernel still caches. The soaks found
+a connection leaked per control request and interrupted FUSE requests answered with EIO, both fixed. The 24-hour run
+is `make soak`.
 
 ### Phase 6: Packaging and docs (≈ 3 days)
 
@@ -312,44 +356,62 @@ objects   (ino INTEGER PRIMARY KEY, uuid TEXT UNIQUE, key TEXT);  -- inode numbe
 spools    (id TEXT PRIMARY KEY, ino INTEGER, key TEXT, path TEXT, state TEXT, replaces TEXT, upload_uuid TEXT,
            created_at INTEGER, committed_at INTEGER, attempts INTEGER, error TEXT,
            queued TEXT);  -- writes not uploaded yet; queued: JSON of metadata and tags set before the upload (Phase 4)
-sync_state(key TEXT PRIMARY KEY, value TEXT);  -- list cursor, last full scan, last removed sweep, groups cursor
+sync_state(key TEXT PRIMARY KEY, value TEXT);  -- list cursor, last full scan, last removed sweep, traffic_day and
+           -- traffic_used of the traffic budget (Phase 5)
+node_salts(key TEXT PRIMARY KEY, salt INTEGER);  -- node keys whose plain id collided (Phase 5, §4.3)
 ```
 
 ### 4.2 Sync algorithm
 
 - Full scan: `GET /files/?ordering=datetime_uploaded&limit=1000&from=<cursor>` until exhausted; upsert; cursor =
   last `datetime_uploaded` (re-fetch of equal timestamps is deduplicated by uuid).
-- Incremental: same call from the cursor every `--sync-interval` (default 30 s).
+- Incremental: same call from the cursor every `--sync-interval` (default 30 s); the first runs as the mount starts, in
+  the background when the index was synced before. Failures back off, doubling up to 10 minutes (Phase 5).
 - Removals: `removed=true` listing every 10 min marks `removed`; a CDN 404 on read does the same immediately.
 - Metadata and tags changed by other clients are not visible in listings: refreshed lazily on `getxattr` and
-  `ucfs resolve` when older than `--meta-ttl` (5 min), and by `ucfs index sync --full`; `ucfs index refresh <uuid>`
-  was not built. So `tags/` shows a tag set elsewhere on an already listed file only after such a refresh; tags set
+  `ucfs resolve` when older than `--meta-ttl` (5 min), by `ucfs index sync --full`, and for chosen files by
+  `ucfs index refresh <uuid>...` (Phase 5). So `tags/` shows a tag set elsewhere on an already listed file only after such a refresh; tags set
   through the mount (`user.uc.tags`, uploads) show at once.
-- Groups: `GET /groups/?ordering=datetime_created&from=<cursor>` with every removed sweep (10 min) when `groups/` is
-  mounted; members on first listing of a group.
+- Groups: every group, `GET /groups/?ordering=datetime_created` from the start, with every removed sweep (10 min) when
+  `groups/` is mounted; groups no longer listed are dropped (Phase 5); members on first listing of a group.
 - Search API is used only by `ucfs resolve --search` and by tree repair, never on the request path.
 
 ### 4.3 Node ids and NFS file handles
 
-`NodeID` is a 64-bit FNV-1a hash of `(view, uuid, ops-or-path)`; collisions are detected at insert and resolved by
-rehashing with a salt stored in the index (deferred to Phase 5: Phase 1 uses the plain hash, about 3·10⁻⁸ collision
-chance at 1 M files). NFS file handles are self-describing (`version:1 byte, kind:1 byte, reserved:2 bytes,
+`NodeID` is a 64-bit FNV-1a hash of `(view, uuid, ops-or-path)`, or an object's inode number (tree and shadow files).
+Since Phase 5 the front-ends take ids from `FS.ID`, which detects collisions where ids are handed out: it records the
+key each id was first handed out for, by a second hash (FNV-1), and for nodes known by path also checks the path
+`node_ops` recorded in an earlier run. A key whose id is taken gets the hash of the key and a salt, and the salt goes
+to `node_salts (key, salt)` in the index, so the key keeps its id across restarts. Object inode numbers cannot move, so
+a hashed id that meets one is the one salted. Ids kept for the check are bounded at 2^18 (salts are kept for good); the
+check costs about 94 ns per id. Without it a collision (about 3·10⁻⁸ at 1 M files) would have made go-fuse serve one
+node for another, and an NFS handle of a path node resolve to the other path. NFS file handles are self-describing (`version:1 byte, kind:1 byte, reserved:2 bytes,
 uuid:16 bytes, hash:8 bytes`), so a restarted daemon serves old handles without a path cache and never returns
 `ESTALE` for files that still exist. Handles must be a multiple of 4 bytes long: go-nfs reads them with
 `xdr.ReadOpaque`, which skips no XDR padding, and a 26-byte handle made every ACCESS reply deny everything.
 A variants view node (`-`, an operation, an argument, the variant) hashes its operations path, such as
 `-/resize/1200x/`, which does not fit in the handle. The first handle handed out for such a node records
 `(id, uuid, ops)` in `node_ops` (`INSERT OR IGNORE` behind an in-memory set), and decoding looks the path up by id,
-so these handles also survive a restart; an id never handed out is `ESTALE`.
+so these handles also survive a restart; an id never handed out is `ESTALE`. The MOUNT reply offers `AUTH_UNIX` only,
+so clients send the caller's uid, and ACCESS grants nothing to uids other than the daemon's and root (Phase 5).
 
 ### 4.4 Read path
 
 Open → sequential detector per object (streams per reader) → block cache (`<cache>/blocks/<uuid>/<blockno>` for
-originals, `<cache>/blocks/<uuid>~<hash(ops, etag)>/<blockno>` for variants) → singleflight → ranged `GET`. Prefetch
-window starts at 1 MiB and doubles while reads stay sequential, up to 16 MiB, bounded by the traffic budget. Originals
-never revalidate. A variant's HEAD answer expires after 24 h; the next access sends a new `HEAD`, and a changed size or
-ETag drops the old blocks. A variant the CDN re-renders with other bytes inside those 24 h could mix blocks of both
-renderings; comparing the ETag of every 206 with the recorded one would catch it (Phase 5, item 34).
+originals, `<cache>/blocks/<uuid>~<hash(ops, etag)>/<blockno>` for variants) → singleflight → traffic budget → a slot of
+the mount's `cdn.Limiter` (reads before prefetches) → ranged `GET` → ETag check → block stored. Prefetch window starts
+at 1 MiB and doubles while reads stay sequential, up to 16 MiB; a prefetch waits in the limiter's queue without a
+goroutine and stops while the budget is down to its reserve. Originals never revalidate. A variant's HEAD answer
+expires after 24 h; the next access sends a new `HEAD`, and a changed size or ETag drops the old blocks.
+
+Since Phase 5 every range's ETag is compared with its object's, weakly (the CDN sends `W/` on variants): a variant's is
+its `HEAD`'s, an original's the first its ranges returned in this process; the CDN answered the same ETag on `HEAD`,
+`206` and `416` (measured). A mismatch drops the object's blocks and fails the read with `EIO`, and the next access to
+a variant sends a new `HEAD`. A reader that already received old blocks cannot be helped by a retry, and NFS has no
+open handle, so the cache keeps an epoch per object that every content change bumps: a read that continues a stream
+begun in an earlier epoch fails once (a read from offset 0 starts over), a read during which any fetch saw a change
+fails, and an original's block fetched before a change is refused when stored after it. So no reader gets a file made
+of two renderings, also across a variant's daily `HEAD` that finds new content.
 
 ### 4.5 Write path
 
@@ -369,37 +431,53 @@ current path in `node_ops`, which a rename rewrites.
 ### 4.6 Mount options (confirmed by Spike A)
 
 macOS, run as the user: `mount_nfs -o port=P,mountport=P,vers=3,tcp,locallocks,noresvport,rsize=1048576,
-wsize=1048576,readahead=0,nfc,soft,intr,acregmax=3600,acdirmax=5,nobrowse[,rdonly] 127.0.0.1:/ <dir>`. Without
+wsize=1048576,readahead=0,nfc,soft,intr,acregmax=3600,acdirmax=5,nosuid,nodev,nobrowse[,rdonly] 127.0.0.1:/ <dir>`
+(`nosuid,nodev` since Phase 5; macOS forces them on such a mount anyway). Without
 `rsize`/`wsize` the client negotiates 32 KiB. `readahead=0` is a traffic choice: at 1 MiB blocks the client's default
 read-ahead turns a 4 KiB read into 16 MiB of traffic. Re-measured in Phase 1 with the daemon's concurrent prefetch:
 cold `cat` of 16 MB takes the same 1.4–1.5 s at `readahead` 0 and 2, while `head -c 4096` costs 1 MiB at 0 and 2 MiB
 at 2, so 0 stays the default and `--readahead` overrides it. `127.0.0.1`, not `localhost`, which can
 resolve to `::1`. `nobrowse` keeps the mount out of the Finder sidebar; `rdonly` with `--read-only`. Linux FUSE:
-`fsname=ucfs`, `noatime`, `max_read=1048576`, no `allow_other`, `ro` with `--read-only`.
+`fsname=ucfs`, `noatime`, `nosuid`, `nodev`, `max_read=1048576`, no `allow_other`, `ro` with `--read-only`; Linux NFS,
+the fallback, which needs root: `nfsvers=3,proto=tcp,mountproto=tcp,nolock,soft,rsize/wsize=1048576,acregmax=3600,
+acdirmax=5,nosuid,nodev[,ro]` (mounted for the first time in Phase 5, in a VM with root).
 
 ## 5. Testing strategy
 
-- Unit tests for `vfs`, `cache`, `spool`, `index` against `internal/fake` (REST with cursor pagination, metadata,
-  storage, search; Upload with base and multipart; CDN with deterministic bytes, `Range` and `HEAD` for originals and
-  variants).
-- Front-end tests: Linux FUSE mounted in CI (ubuntu runner with `fuse3`); macOS NFS mounted on a macOS runner as
-  the user (Spike A showed non-root mounting works).
-- Live tests gated by `UCFS_LIVE=1` against `uploadcare-go-test`: upload, read back, metadata round trip, delete.
-- Golden files for `ucfs status --json` and `ucfs resolve --json`.
-- Benchmarks from Phase 5 run on every PR and compared against the previous run.
+- Unit tests for `vfs`, `cache`, `spool`, `index`, `api`, `cdn` against `internal/fake` (REST with cursor pagination,
+  metadata, storage, search, groups, and since Phase 5 a REST denial with the live 403 body, persistent throttling and
+  REST latency; Upload with base and multipart; CDN with content generated by chunk, `Range` and `HEAD` for originals
+  and variants, latency, failures by status and an original that changes under its uuid). `make race` runs them
+  under the race detector (cgo); every package passes on macOS and, as root with FUSE mounted, in an Ubuntu 26.04 VM.
+- Command tests (`cmd/ucfs`) run the `ucfs` command in-process against the fake (`apiTransport`) and, with
+  `UCFS_MOUNT_TESTS=1`, mount for real: NFS on macOS as the user, FUSE on Linux, NFS on Linux as root
+  (`UCFS_FRONTEND=nfs`). The degraded API, the traffic budget and throttled writes are tested this way;
+  `TestServeFake` keeps a fake project mounted for checks by hand (Finder, other users).
+- Front-end tests: Linux FUSE mounted in CI (`ubuntu-latest` with `fuse3`; with `UCFS_MOUNT_TESTS=1` a test that cannot
+  mount fails rather than skips); NFS over RPC with `go-nfs-client`. macOS runners are left out of CI: the repository
+  is private, and macOS minutes cost ten times as much.
+- Live measurements by hand against a test project, as the `docs/phaseN.md` reports describe, with `spikes/measure`,
+  `spikes/rest` and `spikes/keygrep`; no live test runs in CI, which holds no keys.
+- Benchmarks (`make bench`) run in CI on every pull request, with the table compared against the previous run's
+  medians in the job summary; `bin/bench.txt` of two runs also goes into `benchstat`.
+- Soak: `make soak` (24 h against the fake; `UCFS_SOAK_LIVE` for a real project).
 
 ## 6. Risks and where they are retired
 
 | Risk | Phase that answers it | Fallback |
 |---|---|---|
 | Non-root NFS mount on macOS | Retired in 0 (Spike A): works as the user | — |
-| Unpublished rate limits during full scans | Open after 0 (Spike E ran on a 33-file project; one request, no 429) | adaptive page delay, resume from cursor (implemented) |
-| `original_filename` mangling | Retired in 0 (Spike D) except names with `\` (base upload strips through the last `\` or `/`) | store the written name in `ucfs:name` metadata and display it; `EINVAL` until then |
-| Finder/Spotlight traffic | 0 (Spike C), 3, 5. Spotlight is off on NFS mounts by default; a Finder window read every visible test image in full on first visit (JPEGs without an embedded thumbnail, also with `readahead=0`; Quick Look caches thumbnails across mounts, docs/phase1.md), and `.ql_disablethumbnails` does not stop it | `nobrowse`, `rdonly`, `readahead=0`, shadow files, traffic counter and budget |
+| Unpublished rate limits during full scans | 5, as far as ucfs can without a live 429: Retry-After retries (5, up to 60 s each), at most 4 REST requests in flight, and a sync loop that backs off to 10 minutes; throttled for a sync interval, the mount serves the index and refuses writes with `EAGAIN`. Spike E ran on a 33-file project and saw no 429 | resume from cursor (implemented) |
+| API access withdrawn (a project over its usage limit answers every REST request 403 `permission_error`, Phase 3) | Retired in 5: a mount with an index starts and serves the index and the block cache, refuses writes with `EACCES`, backs off its syncs and says `API denied since` in `ucfs status` (measured against the fake on all three front-ends) | — |
+| `original_filename` mangling | Retired in 0 (Spike D), and in 5 for names with `\`: they upload with underscores and whole in `ucfs:name`, which the index shows | — |
+| Finder/Spotlight traffic | 0 (Spike C), 3, 5. Spotlight is off on NFS mounts by default; a Finder window read every visible test image in full on first visit (JPEGs without an embedded thumbnail, also with `readahead=0`; Quick Look caches thumbnails across mounts, docs/phase1.md), and `.ql_disablethumbnails` does not stop it. Bounded in 5 by `--traffic-budget`: a `by-date/` window past the budget got `EDQUOT` once per photo, without retries; files the mount uploaded cost nothing, being in the block cache | `nobrowse`, `rdonly`, `readahead=0`, shadow files, traffic counter and budget (implemented) |
 | NFS has no close event | 3: macOS sends COMMIT, or a single stable WRITE for a small file, right after the data once go-nfs answers WRITE with `UNSTABLE`; the upload starts 300 ms later, and upload errors cannot reach the writer | 3 s idle commit; FUSE-T front-end in V1.1 for strict semantics |
 | No xattrs over NFSv3 on macOS | 4: `ucfs resolve [--json]` prints metadata and tags, refreshed after `--meta-ttl` | the CLI for writes; xattrs on macOS with the FUSE-T front-end in V1.1 |
-| go-nfs maturity ("minimally tested") | 1, 2, 5 (soak) | fork and fix, taken in Phase 2: `third_party/go-nfs` passes errnos through (LOOKUP could only fail with `NOENT`); offer the patch upstream. rclone uses the same library in production |
-| Stale index after foreign writes | 1, 4: metadata and tags refresh lazily on `getxattr` and `resolve` (`--meta-ttl`); `tags/` follows only refreshed files | 30 s sync, `ucfs index sync --full` |
+| go-nfs maturity ("minimally tested") | 1, 2, 5: a 3-hour soak on macOS NFS (168,000 operations, 5,344 uploads) and 2 hours live with Finder open saw no NFS error other than ENOENT and ESTALE for files removed meanwhile. Phase 5 also found that it offered only `AUTH_NULL` and granted every ACCESS | fork and fix, taken in Phase 2: `third_party/go-nfs` passes errnos through (LOOKUP could only fail with `NOENT`), COMMIT (3) and an ACCESS filter (5); offer the patches upstream. rclone uses the same library in production |
+| Other local users reading the project | 5: through the mount point, retired (ACCESS grants only the daemon's uid and root; FUSE has no `allow_other`). Through the loopback NFS port, open: any local process can speak NFS to it and claim any uid (measured) | FUSE-T front-end in V1.1 (no network port), or checking the owner of the peer socket on macOS |
+| Mixed bytes from a variant re-rendered while read | Retired in 5: every range's ETag is checked, and a read that could mix contents fails with `EIO` | — |
+| Node id collisions | Retired in 5: detected where ids are handed out and salted, salts kept in the index | — |
+| Stale index after foreign writes | 1, 4: metadata and tags refresh lazily on `getxattr` and `resolve` (`--meta-ttl`); `tags/` follows only refreshed files. 5: `ucfs index refresh <uuid>`, and deleted groups leave `groups/` | 30 s sync, `ucfs index sync --full` |
 
 ## 7. Strategic notes
 
