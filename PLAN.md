@@ -50,8 +50,10 @@ internal/ctl/                  unix-socket control API used by `ucfs status`
 internal/fake/                 httptest doubles for REST, Upload API and CDN used by tests
 third_party/go-nfs/            go-nfs at the pinned commit with the errno, COMMIT and exclusive-create patches (README.ucfs.md), wired in by a go.mod replace
 testdata/                      golden files, fixtures
-docs/                          mount options, troubleshooting, Finder notes
-Makefile  .goreleaser.yaml  .github/workflows/ci.yml  CLAUDE.md  AGENTS.md
+docs/                          mount options, Finder notes, costs, semantics, troubleshooting, release, phase reports
+scripts/install.sh             installer for release archives (Phase 6)
+contrib/                       launchd and systemd examples (Phase 6)
+Makefile  .goreleaser.yaml  .github/workflows/{ci,release}.yml  CLAUDE.md  AGENTS.md
 ```
 
 ## 3. Phases
@@ -278,14 +280,42 @@ the read-only attributes; both are fixed.
 
 ### Phase 6: Packaging and docs (≈ 3 days)
 
-39. Decide where the public repo lives (`alxgsv/ucfs` or the `uploadcare` org), make it public, and name the Homebrew tap to match.
-40. `.goreleaser.yaml`: darwin arm64/amd64, linux amd64/arm64; Homebrew tap formula; `install.sh` in the style of the CLI.
-41. launchd plist and systemd unit examples for persistent mounts; `ucfs mount --daemon`.
-42. `docs/`: mount options, Finder and Spotlight notes, cost guidance (what pulls CDN traffic), semantics table
-    (what works, what returns `EOPNOTSUPP`), troubleshooting.
-43. `CLAUDE.md`/`AGENTS.md` with build, test and live-test instructions.
+39. Where the public repository lives is the owner's decision, prepared in [docs/release.md](docs/release.md):
+    `alxgsv/ucfs` with the tap `alxgsv/homebrew-tap` (formula `alxgsv/tap/ucfs`), which everything is configured for,
+    or `uploadcare/ucfs`, a module path change in `go.mod` and 47 Go files plus the places the doc lists; the licence
+    (none yet; uploadcare-cli's MIT is the natural default); unsigned, unnotarized binaries; and the steps once
+    decided: make the repository public, create the tap, add `HOMEBREW_TAP_TOKEN`, fix the Actions billing, push
+    `v0.1.0`. None of them is done.
+40. `.goreleaser.yaml` (goreleaser v2): `CGO_ENABLED=0` builds for darwin and linux on amd64 and arm64 with
+    `-trimpath`, version, commit and date in `ucfs version`; `ucfs_<version>_<os>_<arch>.tar.gz` archives with the
+    README and `contrib/`; `checksums.txt`; a Homebrew formula with a `test do` (`ucfs version`), caveats and
+    `contrib/` in `pkgshare`, pushed to the tap with `HOMEBREW_TAP_TOKEN` and skipped for pre-releases. It uses the
+    deprecated `brews` section, as casks have no test block and are quarantined: goreleaser 2.20's `check` exits 2
+    on it. `.github/workflows/release.yml` runs the tests and goreleaser on a `v*` tag; `make snapshot` builds
+    `dist/` locally. `scripts/install.sh` follows uploadcare-cli's: `VERSION`, `INSTALL_DIR`, `UNINSTALL` and flags
+    of the same names, checksum check, `sudo` only when the directory needs it, plus `--base-url`/`UCFS_BASE_URL`
+    for a local `dist/`; it picks the archive from `checksums.txt`, so the latest release needs no API call.
+41. `ucfs mount --daemon` (`cmd/ucfs/daemon.go`) runs the same command again in its own session, stdin from
+    `/dev/null`, output appended to `<cache dir>/mount-<hash>.log`, and returns with the pid once the control socket
+    answers; a daemon that exits first fails the command with what it logged, and one still starting after 10 minutes
+    keeps running. `contrib/launchd/com.uploadcare.ucfs.example.plist` (a user agent: `RunAtLoad`, `KeepAlive` on
+    failure only, `ExitTimeOut` 60 s, the most launchd allows an agent, for the uploads an unmount finishes) and `contrib/systemd/ucfs@.service` (a
+    user unit per escaped mount path: `Type=simple`, `ExecStop=-ucfs umount`, `Restart=on-failure`, flags in a
+    drop-in), each with a README. After a crash both restart into the stale mount until `ucfs umount <dir>` clears
+    it.
+42. `README.md` and `docs/`: [mount-options.md](docs/mount-options.md) (every command and flag, the `status --json`
+    fields, and the Phase 5 additions marked), [finder.md](docs/finder.md), [costs.md](docs/costs.md),
+    [semantics.md](docs/semantics.md) (results and errnos per operation, place and front-end, from the code, with
+    those seen on a mount marked), [troubleshooting.md](docs/troubleshooting.md), [release.md](docs/release.md).
+43. `AGENTS.md`: build, test and lint, the mount tests and live checks, test uploads marked `ucfs:test=1`, leaving no
+    mount or registry record behind, secrets, commit signing and one PR per phase; `CLAUDE.md` imports it.
 
-Result: `brew install alxgsv/tap/ucfs && ucfs mount ~/uc` on a fresh Mac (tap name follows step 39).
+Result: `brew install alxgsv/tap/ucfs && ucfs mount ~/uc` on a fresh Mac once the release exists (tap name follows
+step 39). Measured in [docs/phase6.md](docs/phase6.md): `goreleaser release --snapshot` builds the four archives
+(5.3–5.9 MB); `install.sh` installs from a local server on macOS and on Linux (dash); the generated formula installs
+through a local tap and passes `brew test`; `ucfs mount --daemon` returns in 1.0 s with the mount up, and
+`ls -lR` through it costs 0 CDN bytes; the launchd agent and the systemd unit mount, stay down after `ucfs umount`,
+restart after a failure, and leave nothing behind.
 
 ## 4. Cross-cutting specifications
 
