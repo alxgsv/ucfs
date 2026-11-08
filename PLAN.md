@@ -246,7 +246,7 @@ resolve to `::1`. `nobrowse` keeps the mount out of the Finder sidebar; `rdonly`
 | Non-root NFS mount on macOS | Retired in 0 (Spike A): works as the user | — |
 | Unpublished rate limits during full scans | Open after 0 (Spike E ran on a 33-file project; one request, no 429) | adaptive page delay, resume from cursor (implemented) |
 | `original_filename` mangling | Retired in 0 (Spike D) except names with `\` (base upload strips through the last `\` or `/`) | store the written name in `ucfs:name` metadata and display it; `EINVAL` until then |
-| Finder/Spotlight traffic | 0 (Spike C), 3, 5. Spotlight is off on NFS mounts by default; Finder icon view read every test image in full (JPEGs without an embedded thumbnail, also with `readahead=0`), and `.ql_disablethumbnails` does not stop it | `nobrowse`, `rdonly`, `readahead=0`, shadow files, traffic counter and budget |
+| Finder/Spotlight traffic | 0 (Spike C), 3, 5. Spotlight is off on NFS mounts by default; a Finder window read every visible test image in full on first visit (JPEGs without an embedded thumbnail, also with `readahead=0`; Quick Look caches thumbnails across mounts, docs/phase1.md), and `.ql_disablethumbnails` does not stop it | `nobrowse`, `rdonly`, `readahead=0`, shadow files, traffic counter and budget |
 | NFS has no close event | 3 | idle commit; FUSE-T front-end in V1.1 for strict semantics |
 | No xattrs over NFSv3 on macOS | 4 | `ucfs resolve` and the CLI cover metadata on macOS until V1.1 |
 | go-nfs maturity ("minimally tested") | 1, 5 (soak) | fork and fix; rclone uses the same library in production |

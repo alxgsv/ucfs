@@ -61,17 +61,26 @@ Cold reads of the 16.3 MB file (A) and the 12.4 MB file (B), alone and started t
 |---|---|---|---|---|---|---|
 | macOS, round 1 | 1.41 s | 1.54 s | 1.81 s | 1.51 s | 20 ms | 11 ms |
 | macOS, round 2 | 1.38 s | 1.16 s | 2.01 s | 1.61 s | 21 ms | 11 ms |
+| Linux, earlier build | 1.17 s | 1.08 s | 2.72 s | 2.72 s | 3 ms | 4 ms |
 | Linux, round 1 | 1.24 s | 1.65 s | 2.54 s | 2.68 s | 3 ms | 4 ms |
 | Linux, round 2 | 1.99 s | 1.14 s | 1.17 s | 1.14 s | 3 ms | 4 ms |
 | Linux, round 3 | 1.13 s | 1.01 s | 1.33 s | 1.49 s | 3 ms | 4 ms |
 
 - Metadata never waits for reads.
 - Two readers together finish in about the time of the slower solo read plus bandwidth sharing. On macOS, combined throughput rose from about 11 MB/s solo to about 14 MB/s.
-- Linux round 1 is slower in both columns, and the round-to-round spread on that host is network variance; rounds 2–3 show no slowdown.
+- On Linux, two of four runs took about twice the solo time together. The host's network behaves the same way without ucfs. `curl` of the two CDN URLs, three rounds:
 
-## Finder icon view traffic (macOS)
+  | Round | Solo A | Solo B | Parallel A | Parallel B |
+  |---|---|---|---|---|
+  | 1 | 1.18 s | 1.01 s | 2.63 s | 1.87 s |
+  | 2 | 1.41 s | 5.16 s | 1.86 s | 1.70 s |
+  | 3 | 1.36 s | 2.25 s | 5.77 s | 5.05 s |
 
-`open <mnt>/files` on a fresh mount, 45 s:
+  Parallel downloads also take up to about twice as long, and solo times vary from 1.0 s to 5.2 s. So those runs are bandwidth sharing on that host, not a stall: metadata stayed at 3–4 ms throughout. Phase 5 item 35 (fair queueing of CDN requests) is where prefetch fairness between readers would be tuned.
+
+## Finder traffic (macOS)
+
+`open <mnt>/files` on a fresh mount, giving a Finder window in its default view (the view mode was not set or checked), observed for 45 s:
 
 - **First visit:** 15 files thumbnailed, **each read in full**, 23,288,128 B in total. Files outside the visible window were not read.
 - **Second visit**, on another mount path with an empty block cache: only the 3 files not thumbnailed before were read, each in full. Quick Look kept the other thumbnails across mounts and mount paths.
