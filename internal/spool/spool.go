@@ -387,6 +387,49 @@ func (s *Spool) ReadAt(p []byte, off int64) (int, error) {
 	return n, err
 }
 
+// Queued returns the metadata set on the spool through extended attributes.
+func (s *Spool) Queued() index.Queued {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return copyQueued(s.row.Queued)
+}
+
+// Queue changes the metadata the upload form will carry; fn edits a copy.
+// Once the upload is under way its form is sent, so changes fail with
+// EAGAIN until it ends.
+func (s *Spool) Queue(fn func(*index.Queued) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch {
+	case s.dropped:
+		return syscall.ESTALE
+	case s.row.State == Uploading:
+		return syscall.EAGAIN
+	}
+	q := copyQueued(s.row.Queued)
+	if err := fn(&q); err != nil {
+		return err
+	}
+	s.row.Queued = q
+	s.persistLocked()
+	return nil
+}
+
+func copyQueued(q index.Queued) index.Queued {
+	out := index.Queued{Meta: make(map[string]string, len(q.Meta))}
+	for k, v := range q.Meta {
+		out.Meta[k] = v
+	}
+	if q.Tags != nil {
+		tags := slices.Clone(*q.Tags)
+		if tags == nil {
+			tags = []string{}
+		}
+		out.Tags = &tags
+	}
+	return out
+}
+
 // changedLocked records a write: an upload in flight is stale now, and the
 // idle timer starts over.
 func (s *Spool) changedLocked() {

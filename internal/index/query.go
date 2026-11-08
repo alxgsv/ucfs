@@ -75,14 +75,14 @@ func (ix *Index) Files(ctx context.Context) ([]File, error) {
 
 // Put upserts files fetched outside a sync, such as a refresh after a CDN 404.
 func (ix *Index) Put(ctx context.Context, files ...api.File) error {
-	return ix.upsert(ctx, files, true)
+	return ix.upsert(ctx, files, true, time.Now())
 }
 
 // PutUploaded records a file the mount just uploaded, without moving the
 // sync cursor; the next sync lists it and replaces the row with the server's
 // view.
 func (ix *Index) PutUploaded(ctx context.Context, f api.File) error {
-	return ix.upsert(ctx, []api.File{f}, false)
+	return ix.upsert(ctx, []api.File{f}, false, time.Now())
 }
 
 // MarkRemoved records a soft delete the mount made.

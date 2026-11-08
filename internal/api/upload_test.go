@@ -7,6 +7,9 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
+
+	"github.com/uploadcare/uploadcare-go/v2/ucare"
 
 	"github.com/alxgsv/ucfs/internal/api"
 	"github.com/alxgsv/ucfs/internal/config"
@@ -93,5 +96,78 @@ func TestUploadErrors(t *testing.T) {
 	}
 	if !errors.Is(syscall.EAGAIN, api.Errno(&api.UploadError{Status: 429})) {
 		t.Error("429 after retries is not EAGAIN")
+	}
+}
+
+func TestMetadataTagsAndGroups(t *testing.T) {
+	srv, c := client(t)
+	ctx := context.Background()
+	srv.Add(fake.File{UUID: "00000000-0000-4000-8000-000000000001", Name: "a.jpg", Size: 1},
+		fake.File{UUID: "00000000-0000-4000-8000-000000000002", Name: "b.jpg", Size: 1})
+	uuid := "00000000-0000-4000-8000-000000000001"
+
+	errnos := map[string]syscall.Errno{
+		strings.Repeat("k", 65): syscall.EINVAL,
+		"empty":                 syscall.EINVAL,
+		"long":                  syscall.E2BIG,
+	}
+	values := map[string]string{strings.Repeat("k", 65): "v", "empty": "", "long": strings.Repeat("v", 513)}
+	for key, want := range errnos {
+		if err := c.SetMetadata(ctx, uuid, key, values[key]); api.Errno(err) != want {
+			t.Errorf("set %.10s: %v (%v), want %v", key, err, api.Errno(err), want)
+		}
+	}
+	for i := range 50 {
+		if err := c.SetMetadata(ctx, uuid, "k"+strings.Repeat("x", i), "v"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.SetMetadata(ctx, uuid, "one-more", "v"); api.Errno(err) != syscall.ENOSPC {
+		t.Errorf("51st key: %v, want ENOSPC", err)
+	}
+
+	tags, err := c.SetTags(ctx, uuid, []string{"B", "a", "b"})
+	if err != nil || strings.Join(tags, ",") != "b,a" {
+		t.Errorf("tags = %q, %v", tags, err)
+	}
+	many := make([]string, 51)
+	for i := range many {
+		many[i] = "t" + strings.Repeat("x", i)
+	}
+	if _, err := c.SetTags(ctx, uuid, many); err == nil {
+		t.Error("51 tags accepted")
+	}
+
+	id := srv.AddGroup(time.Now(), uuid, "00000000-0000-4000-8000-000000000002")
+	var listed []string
+	if err := c.ListGroups(ctx, time.Time{}, func(g api.Group) error {
+		listed = append(listed, g.ID)
+		return nil
+	}); err != nil || len(listed) != 1 || listed[0] != id {
+		t.Errorf("groups = %q, %v", listed, err)
+	}
+	srv.Remove("00000000-0000-4000-8000-000000000002")
+	g, err := c.GroupInfo(ctx, id)
+	if err != nil || g.ID != id || len(g.Members) != 2 || g.Members[0].Name != "a.jpg" || g.Members[1] != nil {
+		t.Errorf("group info = %+v, %v", g, err)
+	}
+	if _, err := c.GroupInfo(ctx, "00000000-0000-4000-8000-000000000009~1"); !api.IsNotFound(err) {
+		t.Errorf("missing group: %v", err)
+	}
+}
+
+// The live API's 400 messages for the metadata and tag limits (2026-11-08).
+func TestLimitErrnos(t *testing.T) {
+	for msg, want := range map[string]syscall.Errno{
+		"Number of metadata keys per file has been exceeded. The limit is 50.": syscall.ENOSPC,
+		"Length of key `kkk` is exceeded. The limit is 64.":                    syscall.ENAMETOOLONG,
+		"Value length of key `v513` is exceeded. The limit is 512.":            syscall.E2BIG,
+		"Value of key `empty` can not be empty.":                               syscall.EINVAL,
+		`{"tags":["Too many tags: 51 (max 50)."]}`:                             syscall.ENOSPC,
+		`{"tags":{"0":["Tag too long: 101 chars (max 100)."]}}`:                syscall.ENAMETOOLONG,
+	} {
+		if got := api.Errno(ucare.APIError{StatusCode: 400, Detail: msg}); got != want {
+			t.Errorf("%q = %v, want %v", msg, got, want)
+		}
 	}
 }

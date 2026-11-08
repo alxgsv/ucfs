@@ -342,45 +342,7 @@ func (s *Server) deleteStorage(w http.ResponseWriter, r *http.Request) {
 	}
 	f, _ := s.find(uuid)
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write(fileJSON(f))
-}
-
-func (s *Server) putMetadata(w http.ResponseWriter, r *http.Request) {
-	var v string
-	if err := json.NewDecoder(r.Body).Decode(&v); err != nil || utf8.RuneCountInString(v) > 512 {
-		http.Error(w, `{"detail":"invalid value"}`, http.StatusBadRequest)
-		return
-	}
-	key := r.PathValue("key")
-	if !s.update(r.PathValue("uuid"), func(f *File) {
-		m := make(map[string]string, len(f.Metadata)+1)
-		for k, x := range f.Metadata {
-			m[k] = x
-		}
-		m[key] = v
-		f.Metadata = m
-	}) {
-		http.Error(w, `{"detail":"Not found."}`, http.StatusNotFound)
-		return
-	}
-	writeJSON(w, v)
-}
-
-func (s *Server) deleteMetadata(w http.ResponseWriter, r *http.Request) {
-	key := r.PathValue("key")
-	if !s.update(r.PathValue("uuid"), func(f *File) {
-		m := make(map[string]string, len(f.Metadata))
-		for k, x := range f.Metadata {
-			if k != key {
-				m[k] = x
-			}
-		}
-		f.Metadata = m
-	}) {
-		http.Error(w, `{"detail":"Not found."}`, http.StatusNotFound)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
+	_, _ = w.Write(s.fileJSON(f))
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

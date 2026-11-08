@@ -122,9 +122,10 @@ func (m *Manager) discard(uuid string) {
 }
 
 // prepare builds the upload of a spool: its written name, the metadata of
-// the file it replaces with the configured metadata and its tree path on
-// top, and the replaced file's tags. The replaced file's metadata comes from
-// the API: listings do not show changes other clients made after a file was
+// the file it replaces with the configured metadata, the metadata queued
+// on the spool and its tree path on top, and the replaced file's tags
+// unless tags were queued. The replaced file's metadata comes from the
+// API: listings do not show changes other clients made after a file was
 // first listed, so the index may hold old values.
 func (m *Manager) prepare(ctx context.Context, s *Spool) api.Upload {
 	meta := map[string]string{}
@@ -138,6 +139,12 @@ func (m *Manager) prepare(ctx context.Context, s *Spool) api.Upload {
 	}
 	for k, v := range m.o.Metadata {
 		meta[k] = v
+	}
+	for k, v := range s.row.Queued.Meta {
+		meta[k] = v
+	}
+	if q := s.row.Queued.Tags; q != nil {
+		tags = *q
 	}
 	delete(meta, index.TreePathKey)
 	if tp := TreePath(s.row.Path); tp != "" {
