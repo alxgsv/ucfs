@@ -24,7 +24,7 @@ Decisions fixed up front:
 |---|---|---|
 | Language, toolchain | Go 1.26, `CGO_ENABLED=0` | Matches `uploadcare-go` and `uploadcare-cli`; static binaries; cross-compile for darwin/linux from one machine |
 | Repository and module path | `github.com/alxgsv/ucfs`, private for now, checkout `~/workspace/ucfs` | Personal repo while experimental; the module path equals the repo path, so going public needs no rename. A later move to the `uploadcare` org is a module-path change in `go.mod` and imports, nothing structural |
-| macOS front-end | Loopback NFSv3 server (`github.com/willscott/go-nfs` at master `c092ae79c64e` for `Server.ConcurrentHandlers`, which v0.0.4 lacks; carried in `third_party/go-nfs` since Phase 2 with a patch that passes errnos through as NFS statuses) mounted with the built-in `mount_nfs` as the user, no `sudo` (Spike A) | Zero install, no kext, works on managed Macs. Proven by rclone `nfsmount` |
+| macOS front-end | Loopback NFSv3 server (`github.com/willscott/go-nfs` at master `c092ae79c64e` for `Server.ConcurrentHandlers`, which v0.0.4 lacks; carried in `third_party/go-nfs` since Phase 2 with a patch that passes errnos through as NFS statuses, and since Phase 3 one that passes COMMIT to the filesystem) mounted with the built-in `mount_nfs` as the user, no `sudo` (Spike A) | Zero install, no kext, works on managed Macs. Proven by rclone `nfsmount` |
 | Linux front-end | FUSE via `github.com/hanwen/go-fuse/v2` (pure Go) | No libfuse dependency, full semantics (close, xattrs, invalidation). NFS front-end also builds on Linux as a fallback |
 | Index | SQLite via `modernc.org/sqlite` | Pure Go; WAL gives concurrent readers; survives restarts |
 | API client | `github.com/uploadcare/uploadcare-go/v2` (`file`, `upload`, `metadata`, `tag`, `group`, `project`) with `RetryConfig` enabled | Already covers list, search, info, store/delete, local copy, base and multipart upload, metadata, tags, groups |
@@ -41,14 +41,14 @@ internal/api/                  thin layer over uploadcare-go: paged listing, inf
 internal/cdn/                  per-project CDN base, URL building, HEAD, ranged GET, variant operation grammar
 internal/index/                SQLite schema and migrations, full scan, incremental sync, removed sweep, group sync, queries
 internal/cache/                on-disk block cache, LRU eviction, singleflight, sequential detector, adaptive prefetch, traffic accounting
-internal/spool/                write spool, commit (upload), overwrite policy, alias table, upload journal
+internal/spool/                write spool, commit triggers, upload, overwrite policy, aliases, upload journal, crash recovery
 internal/vfs/                  platform-neutral filesystem model: node ids, attrs, lookup/readdir/open/read/write/flush, xattrs, local-only shadow files
-internal/vfs/views/            files, variants, tree, bydate, tags, groups (one file each; files and variants are vfs.go and variants.go in internal/vfs so far)
+internal/vfs/views/            files, variants, tree, bydate, tags, groups (one file each; files, variants and tree are vfs.go, variants.go and tree.go in internal/vfs so far, writes write.go, shadow files shadow.go)
 internal/frontend/nfs/         go-nfs Handler (stable file handles), billy.Filesystem adapter, mount_nfs/umount driver (darwin, linux)
 internal/frontend/fuse/        go-fuse adapter (linux build tag)
 internal/ctl/                  unix-socket control API used by `ucfs status`
 internal/fake/                 httptest doubles for REST, Upload API and CDN used by tests
-third_party/go-nfs/            go-nfs at the pinned commit with the errno patch (README.ucfs.md), wired in by a go.mod replace
+third_party/go-nfs/            go-nfs at the pinned commit with the errno, COMMIT and exclusive-create patches (README.ucfs.md), wired in by a go.mod replace
 testdata/                      golden files, fixtures
 docs/                          mount options, troubleshooting, Finder notes
 Makefile  .goreleaser.yaml  .github/workflows/ci.yml  CLAUDE.md  AGENTS.md
@@ -82,7 +82,9 @@ One view end to end through both front-ends.
 12. `internal/cache/`: 1 MiB blocks on disk, size-bounded LRU, singleflight per (uuid, ops, block), sequential detector with prefetch window 1 → 16 MiB, per-mount byte counters. NFS has no open handle (go-nfs re-opens the file for every READ), so the detector is keyed per file and tracks several streams, so two readers of one file do not reset each other's window. Prefetch fetches the blocks ahead concurrently: with `readahead=0` the client sends one READ at a time per reader (Spike A). The window grows per block a reader moves into, not per read call, because Linux splits reads into 128 KiB FUSE requests (docs/phase1.md).
 13. `internal/frontend/nfs/`: `nfs.Handler` with stable, self-describing file handles (version, kind, uuid, ops/path hash) instead of the path-LRU helper; billy adapter over `vfs`; `ConcurrentHandlers` 128; mount/unmount driver using the Spike A option string (§4.6). go-nfs calls `Lstat` on almost every RPC and `Open`+`Stat` on every READ, so both must be index-only. `HandleLimit` must be large because READDIR caps a reply at `HandleLimit()/2` entries, and the handler implements go-nfs's verifier cache so a large directory is not re-listed for every READDIR page.
 14. `internal/frontend/fuse/` (linux): go-fuse node adapter; `MaxReadAhead` and `MaxWrite` 1 MiB; entry/attr timeouts from vfs hints. Mounts as the user through `fusermount3`; `DirectMount` uses mount(2) where allowed, such as root in a container.
-15. `ucfs mount <dir> --read-only` (default on in this phase; on macOS it adds `rdonly`, which stops Finder's `.DS_Store` writes and SETATTRs, Spike C), `ucfs umount <dir>`, `ucfs status` (counters over the control socket).
+15. `ucfs mount <dir> [--read-only]`, `ucfs umount <dir>`, `ucfs status` (counters over the control socket). Mounts
+    were read-only by default through Phase 2; since Phase 3 they are writable, and `--read-only` opts out. On macOS
+    it adds `rdonly`, which stops Finder's `.DS_Store` writes and SETATTRs (Spike C).
 16. Index sync loop: incremental listing every 30 s from the stored cursor; `removed=true` sweep every 10 min; a CDN 404 refreshes the file's info over REST, and only REST decides that it is removed.
 
 Acceptance: on this Mac without installing anything, `ls`, `cat`, `open` an image in Preview and `rsync` a subset out all
@@ -131,29 +133,75 @@ mount whatever `--cache-dir` it was started with.
 
 ### Phase 3: Writes (≈ 5 days)
 
-21. `internal/spool/`: spool files under the cache dir; `Create`/`WriteAt`/`Truncate(0)`, and truncate to the current
-    length as a no-op (macOS `cp` issues one after every write, Spike C); commit = upload with
-    `UPLOADCARE_STORE=1`, part filename = written name (`original_filename`), base upload ≤ 100 MB, multipart above.
-    Base upload keeps only what follows the last `\` in a name (Spike D), so names containing `\` fail with `EINVAL`
-    until the `ucfs:name` fallback exists. Projects can restrict upload file types: `uploadcare-go-test` rejects a
-    random binary with "Uploading of these file types is not allowed" (validation error), which maps to `EPERM`.
-22. Commit triggers: FUSE `Flush` (blocking, error returned to the writer); NFS `COMMIT` or 3 s idle after the last
-    `WRITE`. Zero-length files stay local until written or removed (documented limitation; the API itself accepts
-    empty files, Spike D).
-23. `views/tree`: `tree/<path>/<name>` from metadata key `ucfs:path`; `mkdir`/`rmdir` via `tree_dirs`; `rename` of an
-    uploaded file = one metadata `PUT`; directory rename = N metadata updates with a warning above 1000 entries; files
-    without `ucfs:path` appear under `tree/_inbox/`.
-24. Overwrite policy `--on-overwrite=replace|keep` (default `replace`: upload new, copy metadata and tags, soft-delete
-    old, update index and aliases).
-25. `unlink` → `DELETE /files/{uuid}/storage/`; aliases in `files/` for written names with TTL; `.ucfs/uploads.log`
-    journal (time, path, uuid, size, mime).
-26. Local-only shadow files: `.DS_Store`, `._*`, `.Spotlight-V100`, `.fseventsd`, `.Trashes`, `.TemporaryItems` are
-    stored in the cache dir and never uploaded; `.metadata_never_index` always exists at the root.
-27. Crash safety: spools that were being uploaded are retried on the next `ucfs mount`; `ucfs spool list|retry|drop`.
+21. `internal/spool/`: a written file is a spool file under `<cache>/spool/` plus a row in the index `spools` table.
+    `WriteAt` and `Truncate` act on the local file, and a truncate to the current length changes nothing (macOS `cp`
+    issues one after every write, Spike C). Commit is an upload with `UPLOADCARE_STORE=1`, the written name as the
+    filename (`original_filename`), the `--upload-metadata key=value` pairs, and the view's own metadata
+    (`ucfs:path`). Files up to 10 MiB go as one base upload, larger ones in 5 MiB parts, 4 at a time
+    (`--multipart-threshold`; 10 MiB is the Upload API's multipart minimum and what uploadcare-go and the CLI use).
+    `internal/api` calls `/base/` and `/multipart/start|complete/` itself, so a multipart upload's uuid is known at
+    its start. Up to 8 uploads run at once (`--upload-concurrency`). Names containing `\` fail with `EINVAL`, since
+    base upload keeps only what follows the last `\` (Spike D), until the `ucfs:name` fallback exists. Errors:
+    "Uploading of these file types is not allowed" (`uploadcare-go-test` rejects a random binary) is `EPERM`, a too
+    large file `EFBIG`, a 429 after the Retry-After retries `EAGAIN` (NFS3ERR_JUKEBOX over NFS), network errors and
+    5xx `EIO` after three tries. A finished upload is recorded in the index without moving the sync cursor (its time
+    comes from the local clock), and its bytes seed the block cache, so reading it back costs no CDN traffic.
+22. Commit triggers: FUSE `Flush` and `Fsync` block until the upload ends and return its errno to the writer. On NFS
+    the upload starts 300 ms after a COMMIT or a stable (`FILE_SYNC`/`DATA_SYNC`) WRITE, or 3 s after the last WRITE
+    (`--commit-idle`); a later write cancels an upload in flight, and an upload of content that changed meanwhile is
+    soft-deleted. `third_party/go-nfs` now answers WRITE with `UNSTABLE` when asked and passes COMMIT and stable
+    WRITEs to the filesystem: stock go-nfs answered `FILE_SYNC`, so clients never sent COMMIT, and macOS sends a file
+    that fits in one 1 MiB WRITE as a single `FILE_SYNC` WRITE. A failed NFS upload is logged and kept as `failed`
+    for `ucfs spool retry`. Zero-length files stay local until written or removed (documented limitation; the API
+    itself accepts empty files, Spike D). A write to a file this mount uploaded less than a minute ago continues it
+    as an overwrite, for writers that pause longer than the idle timer.
+23. `tree/` (`internal/vfs/tree.go`): `tree/<path>/<name>` from metadata key `ucfs:path`, whose value is the
+    absolute path under `tree/`, name included, as written (NFC from macOS), at most 512 characters
+    (`ENAMETOOLONG` beyond). The name comes from the path, not `original_filename`, so `rename` of an uploaded file is
+    one metadata `PUT`; a directory rename is one `PUT` per file below it, with a warning above 1000. Files that share
+    a path are told apart by a uuid suffix (`photo~1a2b3c4d.jpg`), the newest keeping the plain name. Files without a
+    valid `ucfs:path` appear under `tree/_inbox/` by original name, with the same suffix rule. A directory exists
+    while a file below it has a tree path; `mkdir`, and `rm` or `mv` of a directory's last file, keep it in
+    `tree_dirs`, which is local, until `rmdir`. Writes into `files/` create an alias (`aliases` table, `--alias-ttl`,
+    1 h), so `cp x files/photo.jpg && cat files/photo.jpg` works while `ls` shows `<uuid>_photo.jpg`; writes into
+    `files/<uuid>_<name>` and `files/<uuid>/…` are `EROFS`. A written file keeps one inode number and NFS handle
+    through its upload, overwrites and renames (`objects` table), and so does a renamed directory, so macOS, which
+    keeps using the handle of what it renamed, sees no stale handle.
+24. Overwrite policy `--on-overwrite=replace|keep`, default `replace`: upload the new file with the replaced file's
+    current metadata (read over REST, one request: listings do not show metadata other clients changed later) and
+    tags, soft-delete the old one, and point its aliases at the new one; `keep` leaves the old file under a suffixed
+    name. Rename over an uploaded file follows the policy without copying metadata. An NSDocument save (TextEdit)
+    writes into a scratch directory `(A Document Being Saved By <app>)` beside the file and renames over it, which
+    lands as one upload under the final name when the rename comes within the 300 ms settle.
+25. `unlink` soft-deletes through `DELETE /files/{uuid}/storage/`, in `tree/` and for aliases in `files/`. Files with
+    no tree path that the mount did not write (`files/<uuid>_<name>`, `tree/_inbox/`) cannot be removed, overwritten
+    or moved without `--allow-foreign`, so a stray `rm -r` cannot empty a project. `.ucfs/uploads.log` at the mount
+    root shows the journal `<cache>/uploads.log`: one tab-separated line per completed upload with time, path, uuid,
+    size and MIME type. `ucfs resolve <path> [--json] [--wait <d>]` asks the daemon what a path stands for (uuid and
+    CDN URL from the index, aliases and spools, the journal for a path that no longer resolves), since NFSv3 on macOS
+    has no xattrs.
+26. Local-only shadow files: `.DS_Store`, `._*`, `.Spotlight-V100`, `.fseventsd`, `.Trashes`, `.TemporaryItems`, and
+    vim swap files (`.name.swp`, `.swx`, …), which vim rewrites while editing, are stored in `<cache>/shadow/` with
+    a `shadow` row and never uploaded; renamed to an ordinary name in `tree/` or `files/`, a shadow file becomes a
+    spool and uploads. `.metadata_never_index` always exists at the root. A Finder copy of 50 images wrote 51 shadow
+    files with 62 writes.
+27. Crash safety: on the next `ucfs mount`, spools that were queued or uploading are uploaded again. A multipart upload
+    is checked by the uuid recorded at its start: the API lists an abandoned one as a file that is not ready, and it
+    is soft-deleted first; a finished one is only recorded. A base upload that completed before the crash is found in
+    the synced index by name, size, tree path and time. Spools cut off while written stay for `ucfs spool
+    list|retry|drop`, which talk to the running daemon or act on the cache dir when none runs. A writable mount
+    locks its cache dir; unmount uploads what is still being written and waits up to 2 minutes.
 
 Acceptance: `cp photo.jpg tree/photos/` leaves `tree/photos/photo.jpg` with `original_filename` `photo.jpg` and a
 journal line; saving from TextEdit and from `vim` (temp file + rename) works in `tree/`; `rm` soft-deletes; Finder
 copy of a folder with 50 images uploads 50 files and zero sidecars; a killed daemon mid-upload resumes on restart.
+Measured in [docs/phase3.md](docs/phase3.md) on macOS and Linux: the file is readable with its name, tree path,
+journal line and a uuid from `ucfs resolve`, 1.8–4.3 s after `cp` returns on macOS (0.33–0.37 s of it the trigger, the
+rest the upload) and 6–14 ms on Linux, where close waits for the upload; vim saves work on both hosts (in place on
+macOS, with a backup copy on Linux; the rename save is tested against the fake only); an NSDocument save works
+through `FileManager.replaceItemAt` while TextEdit itself sat behind a dialog that needs the user; a Finder
+copy of 50 images made 50 uploads, 0 sidecar uploads and 0 REST requests in 6.6 s; a daemon killed mid-multipart
+upload resumed and the file arrived once on both hosts; a 12.2 MB file went up in parts in 3.6–5.2 s.
 
 ### Phase 4: Metadata, tags, groups, dates (≈ 3 days)
 
@@ -161,7 +209,7 @@ copy of a folder with 50 images uploads 50 files and zero sidecars; a killed dae
     `.tags`; read-write `user.uc.meta.<key>` → metadata API (50-key, 64/512-char limits mapped to `E2BIG`/`ENOSPC`).
 29. `views/tags` (`tags/<tag>/<uuid>_<name>`), `views/groups` (`groups/<group-uuid>/<index>_<name>`),
     `views/bydate` (`by-date/YYYY/MM/DD/<uuid>_<name>`); group sync via `GET /groups/` cursor.
-30. `ucfs resolve <path>` prints uuid, CDN URL and metadata for any path on the mount (via the control socket).
+30. `ucfs resolve <path>` also prints metadata (uuid, CDN URL and pending state came in Phase 3).
 31. Lazy metadata refresh: `getxattr` re-fetches file info when the index entry is older than 5 min.
 32. `--views` flag selects which views are mounted (default `files,tree,by-date`; `tags` and `groups` opt-in).
 
@@ -203,15 +251,19 @@ Result: `brew install alxgsv/tap/ucfs && ucfs mount ~/uc` on a fresh Mac (tap na
 files     (uuid TEXT PRIMARY KEY, name TEXT, size INTEGER, mime TEXT, is_image INTEGER, is_ready INTEGER,
            stored INTEGER, removed INTEGER, uploaded_at INTEGER, stored_at INTEGER, removed_at INTEGER,
            md5 TEXT, width INTEGER, height INTEGER, metadata TEXT /*json*/, tags TEXT /*json*/,
-           tree_path TEXT, info_refreshed_at INTEGER);
-           -- indexes: uploaded_at, name, tree_path, removed
+           tree_path TEXT, info_refreshed_at INTEGER,
+           tree_dir TEXT, tree_key TEXT, name_key TEXT);  -- NFC keys of a valid ucfs:path and of the name (Phase 3)
+           -- indexes: uploaded_at, name, tree_path, removed, (tree_dir, tree_key), name_key
 variants  (uuid TEXT, ops TEXT, size INTEGER, mime TEXT, etag TEXT, checked_at INTEGER, changed_at INTEGER,
            PRIMARY KEY (uuid, ops));                -- changed_at: first HEAD with this size and ETag (Phase 2)
 node_ops  (id INTEGER PRIMARY KEY, uuid TEXT, ops TEXT);  -- operations path behind a variants view node id (Phase 2)
 groups    (uuid TEXT PRIMARY KEY, created_at INTEGER, files TEXT /*json array of uuids*/);
-aliases   (view TEXT, name TEXT, uuid TEXT, expires_at INTEGER, PRIMARY KEY (view, name));
-tree_dirs (path TEXT PRIMARY KEY, created_at INTEGER);
-shadow    (path TEXT PRIMARY KEY, blob_ref TEXT, size INTEGER, mtime INTEGER);
+aliases   (view TEXT, name TEXT, uuid TEXT, expires_at INTEGER, PRIMARY KEY (view, name));  -- index on uuid
+tree_dirs (path TEXT PRIMARY KEY, created_at INTEGER);  -- tree directories kept while empty, local only
+shadow    (path TEXT PRIMARY KEY, blob_ref TEXT, size INTEGER, mtime INTEGER, ino INTEGER UNIQUE, dir INTEGER);
+objects   (ino INTEGER PRIMARY KEY, uuid TEXT UNIQUE, key TEXT);  -- inode number of a file the mount wrote (Phase 3)
+spools    (id TEXT PRIMARY KEY, ino INTEGER, key TEXT, path TEXT, state TEXT, replaces TEXT, upload_uuid TEXT,
+           created_at INTEGER, committed_at INTEGER, attempts INTEGER, error TEXT);  -- writes not uploaded yet
 sync_state(key TEXT PRIMARY KEY, value TEXT);  -- list cursor, last full scan, last removed sweep, groups cursor
 ```
 
@@ -250,9 +302,18 @@ renderings; comparing the ETag of every 206 with the recorded one would catch it
 
 ### 4.5 Write path
 
-Create → spool → writes → commit trigger (FUSE `Flush`, NFS `COMMIT`/idle) → upload → index upsert → alias and
-journal → spool removal. Replacement of an existing name follows `--on-overwrite`. Upload failures return `EIO` on
-`Flush`; on NFS they are logged and the spool is kept for `ucfs spool retry`.
+Create (a new object, or an overwrite that keeps the replaced file's object) → spool → writes → commit trigger
+(FUSE `Flush`/`Fsync`; NFS `COMMIT` or stable `WRITE` + 300 ms, or 3 s idle) → upload (base ≤ 10 MiB, parts above;
+metadata: replaced file's current metadata, `--upload-metadata`, `ucfs:path`) → object row, index row without moving
+the cursor, overwrite policy (soft-delete the replaced file unless `keep`), alias for a name written in `files/`,
+journal line, block cache seeded → spool removal. A write during the upload cancels it; a rename moves the spool and
+uploads it under the new name. Upload errors return their errno on FUSE `Flush` (`EPERM` for a rejected type, `EIO`
+for network and 5xx); on NFS they are logged and the spool is kept for `ucfs spool retry`. Spools queued or uploading
+when the daemon died are uploaded again by the next mount (item 27).
+
+NFS identity: a tree file's handle carries its object's inode number and key (a uuid or zero), so the client's handle
+from CREATE stays valid after the upload and after renames; a tree or shadow directory's handle id is mapped to its
+current path in `node_ops`, which a rename rewrites.
 
 ### 4.6 Mount options (confirmed by Spike A)
 
@@ -262,8 +323,8 @@ wsize=1048576,readahead=0,nfc,soft,intr,acregmax=3600,acdirmax=5,nobrowse[,rdonl
 read-ahead turns a 4 KiB read into 16 MiB of traffic. Re-measured in Phase 1 with the daemon's concurrent prefetch:
 cold `cat` of 16 MB takes the same 1.4–1.5 s at `readahead` 0 and 2, while `head -c 4096` costs 1 MiB at 0 and 2 MiB
 at 2, so 0 stays the default and `--readahead` overrides it. `127.0.0.1`, not `localhost`, which can
-resolve to `::1`. `nobrowse` keeps the mount out of the Finder sidebar; `rdonly` while read-only. Linux FUSE:
-`fsname=ucfs`, `noatime`, `max_read=1048576`, no `allow_other`.
+resolve to `::1`. `nobrowse` keeps the mount out of the Finder sidebar; `rdonly` with `--read-only`. Linux FUSE:
+`fsname=ucfs`, `noatime`, `max_read=1048576`, no `allow_other`, `ro` with `--read-only`.
 
 ## 5. Testing strategy
 
@@ -284,7 +345,7 @@ resolve to `::1`. `nobrowse` keeps the mount out of the Finder sidebar; `rdonly`
 | Unpublished rate limits during full scans | Open after 0 (Spike E ran on a 33-file project; one request, no 429) | adaptive page delay, resume from cursor (implemented) |
 | `original_filename` mangling | Retired in 0 (Spike D) except names with `\` (base upload strips through the last `\` or `/`) | store the written name in `ucfs:name` metadata and display it; `EINVAL` until then |
 | Finder/Spotlight traffic | 0 (Spike C), 3, 5. Spotlight is off on NFS mounts by default; a Finder window read every visible test image in full on first visit (JPEGs without an embedded thumbnail, also with `readahead=0`; Quick Look caches thumbnails across mounts, docs/phase1.md), and `.ql_disablethumbnails` does not stop it | `nobrowse`, `rdonly`, `readahead=0`, shadow files, traffic counter and budget |
-| NFS has no close event | 3 | idle commit; FUSE-T front-end in V1.1 for strict semantics |
+| NFS has no close event | 3: macOS sends COMMIT, or a single stable WRITE for a small file, right after the data once go-nfs answers WRITE with `UNSTABLE`; the upload starts 300 ms later, and upload errors cannot reach the writer | 3 s idle commit; FUSE-T front-end in V1.1 for strict semantics |
 | No xattrs over NFSv3 on macOS | 4 | `ucfs resolve` and the CLI cover metadata on macOS until V1.1 |
 | go-nfs maturity ("minimally tested") | 1, 2, 5 (soak) | fork and fix, taken in Phase 2: `third_party/go-nfs` passes errnos through (LOOKUP could only fail with `NOENT`); offer the patch upstream. rclone uses the same library in production |
 | Stale index after foreign writes | 1, 4 | 30 s sync, lazy refresh, `ucfs index refresh` |
