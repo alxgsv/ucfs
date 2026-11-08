@@ -33,7 +33,9 @@ type Loop struct {
 func (l *Loop) Run(ctx context.Context) {
 	tick := time.NewTicker(l.Interval)
 	defer tick.Stop()
-	lastSweep := time.Now()
+	// The zero time makes the first tick sweep, so a new mount soon drops
+	// files removed while nothing was mounted.
+	var lastSweep time.Time
 	for {
 		select {
 		case <-ctx.Done():
