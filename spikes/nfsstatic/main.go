@@ -10,7 +10,6 @@ import (
 	"image/color"
 	"image/jpeg"
 	"image/png"
-	"io"
 	"log/slog"
 	"math/rand/v2"
 	"net"
@@ -76,7 +75,7 @@ func main() {
 		}
 	}()
 	<-sig
-	st.print(os.Stdout)
+	st.print()
 }
 
 type stats struct {
@@ -98,20 +97,20 @@ func (s *stats) op(name, path string, n int64) {
 	}
 }
 
-func (s *stats) print(w io.Writer) {
+func (s *stats) print() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	fmt.Fprintln(w, "== ops")
+	fmt.Println("== ops")
 	for _, k := range sortedKeys(s.ops) {
-		fmt.Fprintf(w, "%-10s %d\n", k, s.ops[k])
+		fmt.Printf("%-10s %d\n", k, s.ops[k])
 	}
-	fmt.Fprintln(w, "== bytes read per path")
+	fmt.Println("== bytes read per path")
 	for _, k := range sortedKeys(s.read) {
-		fmt.Fprintf(w, "%12d %s\n", s.read[k], k)
+		fmt.Printf("%12d %s\n", s.read[k], k)
 	}
-	fmt.Fprintln(w, "== bytes written per path")
+	fmt.Println("== bytes written per path")
 	for _, k := range sortedKeys(s.written) {
-		fmt.Fprintf(w, "%12d %s\n", s.written[k], k)
+		fmt.Printf("%12d %s\n", s.written[k], k)
 	}
 }
 
