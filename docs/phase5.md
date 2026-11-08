@@ -265,7 +265,17 @@ project's keys. GitHub refused the first four runs of this pull request without 
 started because recent account payments have failed or your spending limit needs to be increased" (the account's
 billing). From 17:27 UTC the jobs ran. On commit 3111f1a ([run 42505053658](https://github.com/alxgsv/ucfs/actions/runs/42505053658))
 lint for both systems passed in 2 min 10 s and the benchmarks in 2 min 36 s; the race job, 4 minutes in, was cancelled
-by the next push, as the workflow's concurrency group asks; the run on the phase's last commit is on the pull request's checks.
+by the next push, as the workflow's concurrency group asks. On ef0a718
+([run 42505507091](https://github.com/alxgsv/ucfs/actions/runs/42505507091)) lint and the benchmarks passed and the
+race job failed on three timing tests, while every FUSE and mount test passed: a sequential read slower than 200 ms
+(350 ms), a second reader slower than 150 ms (170 ms), and the fairness bound (p95 412 ms beside the bulk readers, 52 ms
+alone, 6.6 s with a plain bound). GitHub's standard runner for a private repository has two CPUs, and the fake in the same process
+takes them. The tests now check what they are about instead of a wall-clock bound fit for a fast machine: that prefetch
+fetches overlap (the fake fetcher counts fetches in flight), that the second reader takes less than half of one of
+the slow file's 1-second requests, and that the limiter beats a plain bound by four times, with the bound against the
+read alone kept for runs without the race detector. Under `-race` pinned to two CPUs in the VM (`taskset -c 0,1`) the
+whole suite passes, the fairness test at 190 ms beside against 1.75 s with a plain bound. The run on the commit with these tests is on
+the pull request's checks.
 
 The benchmarks on the runner (linux/amd64, AMD EPYC 7763), from that run's artifact:
 
@@ -415,16 +425,22 @@ The full 24 hours are `make soak` (or `make soak SOAK=6h`), which writes `bin/so
 - **Two flaky NFS tests**: the RPC test client binds a random local port that may be in use, and keeps directory
   entries in a map, so their order varies; the tests retry the dial and sort.
 - **CI could not run at first**: GitHub refused the jobs for the account's billing until 17:27 UTC (*Benchmarks and
-  CI*).
+  CI*). Once it ran, three timing tests with bounds fit for a fast machine failed on the two-CPU runner under `-race`;
+  they now check the behaviour itself.
 
 ## Deferred
 
-- **To Phase 6:** a 24-hour soak (`make soak`; this phase ran 3 hours per platform against the fake and 2 hours
-  live); offering the go-nfs patches upstream (errnos, COMMIT, ACCESS filter), which needs the user's OK.
-- **To V1.1:** keeping other local processes off the loopback NFS port (FUSE-T, or checking the peer socket's owner on
-  macOS); telling the FUSE kernel about removed files so go-fuse can drop their nodes (`NotifyDelete` on the sweep);
-  pruning index rows of files removed long ago; fewer prefetch slots for a reader on a slow link, where the queue
-  cannot share bandwidth.
+Everything deferred past this phase is in PLAN.md, *After V1 (release follow-ups)*, items 44–51:
+
+- 44: the 24-hour soak (`make soak` and a live run), unless Phase 6 runs it;
+- 45: keeping other local processes off the loopback NFS port (FUSE-T, or the peer socket's owner on macOS);
+- 46: telling the FUSE kernel about removed files so go-fuse drops their nodes;
+- 47: pruning index rows of files removed long ago;
+- 48: bandwidth-aware prefetch;
+- 49: explaining the macOS RSS growth with a flat Go heap;
+- 50: observing a live 429;
+- 51: offering the go-nfs patches upstream, which needs the user's OK.
+
 - **Not measured:** a live 429 (the project never throttled; the 403 and 429 paths are measured against the fake
   with the live 403 body); throttled writes on Linux NFS; Finder in `by-date/` of a live project (the fixtures'
   videos live there; done against the fake).

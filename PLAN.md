@@ -331,6 +331,44 @@ is `make soak`.
 
 Result: `brew install alxgsv/tap/ucfs && ucfs mount ~/uc` on a fresh Mac (tap name follows step 39).
 
+### After V1 (release follow-ups)
+
+Work found during the phases that does not block the V1 release. Phases append here what they defer past it.
+
+44. The 24-hour soak, unless Phase 6 ran it: `make soak` (fake, NFS on macOS and FUSE on Linux) and a live run with
+    `UCFS_SOAK_LIVE`, on a machine that does not sleep. Phase 5 ran 3 hours per platform and 2 hours live
+    (docs/phase5.md, *Soak*). Done: the CSVs of a full day in `docs/`, and each gauge flat or levelled off, or the cause
+    of its growth named.
+45. Keep other local processes off the loopback NFS port. The server answers anyone who connects to `127.0.0.1:<port>`,
+    and AUTH_UNIX proves nothing: in Phase 5 a second user read `files/` over raw NFS RPC, with its own uid and with a
+    forged one, and could have written as the mount may. ACCESS now keeps other users out of the mount point, not out
+    of the port. Fix with a front-end without a network port (FUSE-T, V1.1) or, on macOS, by checking the owner of the
+    peer socket (the TCP socket table, `sysctl net.inet.tcp.pcblist_n`) and refusing other uids. Done: the Phase 5
+    probe (`go-nfs-client` as another user) is refused, and the owner's mount works.
+46. Tell the FUSE kernel about removed files. go-fuse keeps a node for every entry the kernel still caches, including
+    files removed since, until the kernel forgets it; in a 3-hour Linux soak with heavy churn the heap grew from 46 to
+    80 MiB that way. On the sweep (and after a CDN 404), invalidate the removed entries (`NotifyDelete` or
+    `NotifyEntry` on their parents) so go-fuse can drop the nodes. Done: a churn soak whose Linux heap levels off.
+47. Prune index rows of files removed long ago. The index keeps a row per removed file (about 1 KB each; 9,000 rows
+    in a 3-hour soak), which `by-date/` and `ucfs resolve` of old paths do not need after a while. Done: rows removed
+    longer than a set age (30 days) go with the sweep, and the index size of a churn soak levels off.
+48. Bandwidth-aware prefetch. The limiter keeps a slot free for reads, but on a slow downlink 24 concurrent 1 MiB
+    prefetches still take the bandwidth: live, a small read's p95 went from 420 to 727 ms beside one bulk reader with no
+    wait for a slot. Size the prefetch concurrency per stream from the measured throughput instead of a fixed share
+    of `--max-inflight`. Done: the live check of Phase 5 keeps the small read's p95 within 1.2× of alone, without
+    slowing a single bulk reader.
+49. Explain the macOS RSS growth. In the 3-hour NFS soak RSS rose from 86 to 108 MiB while the Go heap stayed at
+    20–32 MiB. Candidates: SQLite's allocations in modernc's libc, outside the Go heap, and pages the runtime keeps after
+    peaks. Done: the cause named from a 24-hour run with RSS split by source (heap profile, `runtime/metrics`, the
+    SQLite memory counters), and fixed or bounded.
+50. Observe a live 429. Throttling (Retry-After retries, the degraded mode, JUKEBOX over NFS) is tested against the
+    fake only; the test projects never throttled. Done: a 429 from the live API seen and recorded (headers, Retry-After
+    values), and the fake's throttle matched to it.
+51. Offer the go-nfs patches upstream: errnos as NFS statuses, COMMIT reaching the filesystem with UNSTABLE writes,
+    exclusive CREATE as guarded, and the ACCESS filter (`third_party/go-nfs/README.ucfs.md`). Needs the user's OK
+    before anything is sent. Done: pull requests open on `willscott/go-nfs`, and, once merged, the `replace` in
+    `go.mod` and the copy removed.
+
 ## 4. Cross-cutting specifications
 
 ### 4.1 Index schema
