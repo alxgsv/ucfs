@@ -95,19 +95,13 @@ func lockCache(dir string) (func(), error) {
 	return func() { _ = f.Close() }, nil
 }
 
-// resolved is a vfs.Resolution with the CDN URL a script wants.
-type resolved struct {
-	vfs.Resolution
-	CDNURL string `json:"cdn_url,omitempty"`
-}
-
 type spoolAction struct {
 	IDs []string `json:"ids"`
 	All bool     `json:"all"`
 }
 
 // routes are the control API endpoints of a mount beyond status and unmount.
-func routes(fsys *vfs.FS, spools *spool.Manager, journal *spool.Journal, cdnBase string) []ctl.Route {
+func routes(fsys *vfs.FS, spools *spool.Manager, journal *spool.Journal) []ctl.Route {
 	return []ctl.Route{
 		{Pattern: "POST /resolve", Handler: func(w http.ResponseWriter, r *http.Request) {
 			var in struct {
@@ -118,11 +112,7 @@ func routes(fsys *vfs.FS, spools *spool.Manager, journal *spool.Journal, cdnBase
 				return
 			}
 			res, err := fsys.Resolve(r.Context(), in.Path, journal)
-			out := resolved{Resolution: res}
-			if res.UUID != "" {
-				out.CDNURL = strings.TrimSuffix(cdnBase, "/") + "/" + res.UUID + "/" + res.Ops
-			}
-			ctl.Reply(w, out, err)
+			ctl.Reply(w, res, err)
 		}},
 		{Pattern: "GET /spools", Handler: func(w http.ResponseWriter, _ *http.Request) {
 			if spools == nil {

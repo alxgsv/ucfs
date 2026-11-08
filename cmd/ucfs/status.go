@@ -7,6 +7,7 @@ import (
 	"io"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/dustin/go-humanize"
@@ -122,6 +123,14 @@ func printStatus(w io.Writer, st ctl.Status) error {
 	}
 	_, err = fmt.Fprintf(w, "  api    %d REST, %d Upload API, %d part PUTs, %d throttled\n",
 		st.API.REST, st.API.Upload, st.API.Parts, st.API.Throttled)
+	if err != nil {
+		return err
+	}
+	m := st.Meta
+	_, err = fmt.Fprintf(w, "  views  %s\n"+
+		"  meta   %d info refreshes (%d failed, ttl %s); xattr %d list, %d get, %d set, %d remove; %d md5 HEADs, %d group reads\n",
+		strings.Join(st.Views, ","), m.Refreshes, m.RefreshErrors, m.TTL, m.XattrLists, m.XattrGets, m.XattrSets,
+		m.XattrRemoves, m.MD5Heads, m.GroupFetches)
 	if err != nil || !st.Writes.Enabled {
 		return err
 	}

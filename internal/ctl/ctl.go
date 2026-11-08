@@ -25,11 +25,28 @@ type Status struct {
 	PID      int       `json:"pid"`
 	Started  time.Time `json:"started"`
 
+	Views  []string     `json:"views"`
 	Index  IndexStatus  `json:"index"`
 	CDN    CDNStatus    `json:"cdn"`
 	Cache  CacheStatus  `json:"cache"`
 	API    APIStatus    `json:"api"`
+	Meta   MetaStatus   `json:"meta"`
 	Writes WritesStatus `json:"writes"`
+}
+
+// MetaStatus counts file info refreshes (lazy, when an xattr read or a
+// resolve finds the info older than the TTL), extended attribute calls,
+// CDN HEADs for user.uc.md5 and group info reads.
+type MetaStatus struct {
+	TTL           time.Duration `json:"ttl"`
+	Refreshes     int64         `json:"refreshes"`
+	RefreshErrors int64         `json:"refresh_errors"`
+	XattrLists    int64         `json:"xattr_lists"`
+	XattrGets     int64         `json:"xattr_gets"`
+	XattrSets     int64         `json:"xattr_sets"`
+	XattrRemoves  int64         `json:"xattr_removes"`
+	MD5Heads      int64         `json:"md5_heads"`
+	GroupFetches  int64         `json:"group_fetches"`
 }
 
 // APIStatus counts requests to the REST API, the Upload API, and the
