@@ -1,6 +1,7 @@
 package ctl
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -38,4 +39,41 @@ func TestServeStatusUnmount(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-unmounted
+}
+
+func TestRegistry(t *testing.T) {
+	reg := t.TempDir()
+	live := filepath.Join(t.TempDir(), "live.sock")
+	srv, err := Serve(live, func() Status { return Status{} }, func() {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srv.Close() }()
+	// The mount point goes through a symlink, as /tmp does on macOS.
+	mnt := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(mnt, link); err != nil {
+		t.Fatal(err)
+	}
+	unregister, err := Register(reg, Mount{MountDir: link, Socket: live, PID: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Register(reg, Mount{MountDir: "/gone", Socket: filepath.Join(t.TempDir(), "gone.sock")}); err != nil {
+		t.Fatal(err)
+	}
+	if m, ok := Lookup(reg, mnt); !ok || m.Socket != live {
+		t.Errorf("lookup by the resolved path = %+v, %v", m, ok)
+	}
+	mounts, err := Mounts(reg)
+	if err != nil || len(mounts) != 1 || mounts[0].Socket != live {
+		t.Errorf("mounts = %+v, %v; want only the live one", mounts, err)
+	}
+	if _, ok := Lookup(reg, "/gone"); ok {
+		t.Error("the record of a dead daemon was kept")
+	}
+	unregister()
+	if _, ok := Lookup(reg, link); ok {
+		t.Error("record left after unregister")
+	}
 }

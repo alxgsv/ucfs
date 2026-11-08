@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/dustin/go-humanize"
@@ -31,8 +32,8 @@ func newStatusCmd(g *globalFlags) *cobra.Command {
 				if err != nil {
 					return err
 				}
-				socks = []string{ctl.SocketPath(cfg.CacheDir, dir)}
-			} else if socks, err = ctl.Sockets(cfg.CacheDir); err != nil {
+				socks = []string{socketFor(cfg.CacheDir, dir)}
+			} else if socks, err = allSockets(cfg.CacheDir); err != nil {
 				return err
 			}
 			var all []ctl.Status
@@ -67,6 +68,40 @@ func newStatusCmd(g *globalFlags) *cobra.Command {
 	return cmd
 }
 
+// socketFor finds the control socket of the mount at dir: in the registry of
+// running mounts, or where a daemon using cacheDir puts it.
+func socketFor(cacheDir, dir string) string {
+	if reg, err := ctl.RegistryDir(); err == nil {
+		if m, ok := ctl.Lookup(reg, dir); ok {
+			return m.Socket
+		}
+	}
+	return ctl.SocketPath(cacheDir, dir)
+}
+
+// allSockets lists the control sockets of every registered mount plus those
+// of mounts using cacheDir, which covers a daemon that failed to register.
+func allSockets(cacheDir string) ([]string, error) {
+	socks, err := ctl.Sockets(cacheDir)
+	if err != nil {
+		return nil, err
+	}
+	reg, err := ctl.RegistryDir()
+	if err != nil {
+		return socks, nil
+	}
+	mounts, err := ctl.Mounts(reg)
+	if err != nil {
+		return nil, err
+	}
+	for _, m := range mounts {
+		if !slices.Contains(socks, m.Socket) {
+			socks = append(socks, m.Socket)
+		}
+	}
+	return socks, nil
+}
+
 func printStatus(w io.Writer, st ctl.Status) error {
 	b := func(n int64) string { return humanize.IBytes(uint64(n)) }
 	syncState := "ok"
@@ -99,7 +134,7 @@ func newUmountCmd(g *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			sock := ctl.SocketPath(cfg.CacheDir, dir)
+			sock := socketFor(cfg.CacheDir, dir)
 			if _, err := ctl.Get(sock); err != nil {
 				// No daemon answers, but a mount may be left behind.
 				return unmountDir(dir)
