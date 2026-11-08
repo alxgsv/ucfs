@@ -136,6 +136,12 @@ func (n *node) Open(ctx context.Context, flags uint32) (gofs.FileHandle, uint32,
 		return nil, 0, 0
 	}
 	switch n.n.Kind {
+	case vfs.KindFile, vfs.KindDateFile, vfs.KindViewFile, vfs.KindVariant, vfs.KindTreeFile:
+		if n.v.PastBudget(ctx, n.n) {
+			return nil, gofuse.FOPEN_DIRECT_IO, 0
+		}
+	}
+	switch n.n.Kind {
 	case vfs.KindFile, vfs.KindDateFile, vfs.KindViewFile:
 		return nil, gofuse.FOPEN_KEEP_CACHE, 0
 	}

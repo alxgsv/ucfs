@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alxgsv/ucfs/internal/api"
+	"github.com/alxgsv/ucfs/internal/config"
 	"github.com/alxgsv/ucfs/internal/ctl"
 	"github.com/alxgsv/ucfs/internal/fake"
 	"github.com/alxgsv/ucfs/internal/frontend"
@@ -22,7 +24,8 @@ import (
 // These tests run the ucfs command itself, in this process, against
 // internal/fake: apiTransport carries its REST and Upload API requests and
 // --cdn-base points at its CDN. Those that mount for real (NFS on macOS as
-// the user, FUSE on Linux) need UCFS_MOUNT_TESTS=1.
+// the user, FUSE on Linux) need UCFS_MOUNT_TESTS=1; UCFS_FRONTEND picks
+// another front-end, such as nfs on Linux, which needs root.
 
 const (
 	fakePublicKey = "demopublickeyfake01"
@@ -70,9 +73,17 @@ func needMounts(t testing.TB) {
 func mountFake(t testing.TB, global []string, cache string, flags ...string) *fakeMount {
 	t.Helper()
 	needMounts(t)
-	dir := filepath.Join(t.TempDir(), "mnt")
-	if err := os.Mkdir(dir, 0o755); err != nil {
+	// UCFS_SERVE_DIR mounts at a directory of the caller's choosing, one
+	// other users can reach, unlike the test's temporary directories.
+	dir := os.Getenv("UCFS_SERVE_DIR")
+	if dir == "" {
+		dir = filepath.Join(t.TempDir(), "mnt")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
+	}
+	if fe := os.Getenv("UCFS_FRONTEND"); fe != "" {
+		flags = append(flags, "--frontend", fe)
 	}
 	root := newRootCmd()
 	root.SetArgs(append(append(append([]string{}, global...), "mount", dir), flags...))
@@ -285,4 +296,46 @@ func TestMountThrottledWrite(t *testing.T) {
 		srv.ThrottleREST(0)
 		t.Logf("then: %v after %v", <-done, time.Since(start).Round(time.Millisecond))
 	}
+}
+
+// TestServeFake mounts a fake project of 40 photo-like JPEGs, three days
+// of uploads, and keeps it mounted for UCFS_SERVE_FAKE (a duration), for
+// looking at it by hand: Finder in by-date/, other users. Extra mount flags
+// come from UCFS_SERVE_FLAGS; the mount dir and the status socket are
+// logged and written to UCFS_SERVE_INFO when set.
+func TestServeFake(t *testing.T) {
+	d, err := time.ParseDuration(os.Getenv("UCFS_SERVE_FAKE"))
+	if err != nil {
+		t.Skip("set UCFS_SERVE_FAKE to a duration")
+	}
+	srv := fake.New(t)
+	srv.SetCDNLatency(20 * time.Millisecond)
+	cache := t.TempDir()
+	global := fakeHome(t, srv, cache)
+	client, err := api.New(&config.Config{PublicKey: fakePublicKey, SecretKey: fakeSecretKey, CDNBase: srv.CDNBase()}, srv.Transport())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 40 {
+		body := testJPEG(i)
+		if _, err := client.Upload(context.Background(), api.Upload{Name: fmt.Sprintf("photo-%02d.jpg", i), Size: int64(len(body)),
+			MIME: "image/jpeg", Data: bytes.NewReader(body)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Uploads land at the current time; spread them over three days.
+	now := time.Now()
+	for i, f := range srv.Files() {
+		srv.SetUploaded(f.UUID, now.Add(-time.Duration(i%3)*24*time.Hour))
+	}
+	m := mountFake(t, global, cache, strings.Fields(os.Getenv("UCFS_SERVE_FLAGS"))...)
+	info := fmt.Sprintf("dir=%s\nsock=%s\n", m.dir, m.sock)
+	t.Log(info)
+	if p := os.Getenv("UCFS_SERVE_INFO"); p != "" {
+		if err := os.WriteFile(p, []byte(info), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(d)
+	t.Log(m.statusText(t))
 }

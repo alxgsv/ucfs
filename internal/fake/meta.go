@@ -42,6 +42,15 @@ func (s *Server) SetMetadata(uuid, key, value string) {
 	s.update(uuid, func(f *File) { f.Metadata = with(f.Metadata, key, &value) })
 }
 
+// SetUploaded moves a file's upload time, keeping the listing in upload
+// order.
+func (s *Server) SetUploaded(uuid string, t time.Time) {
+	s.update(uuid, func(f *File) { f.Uploaded = t })
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sort.SliceStable(s.files, func(i, j int) bool { return s.files[i].Uploaded.Before(s.files[j].Uploaded) })
+}
+
 // SetTags changes a file's tags as another client would.
 func (s *Server) SetTags(uuid string, tags ...string) {
 	s.update(uuid, func(f *File) { f.Tags = slices.Clone(tags) })

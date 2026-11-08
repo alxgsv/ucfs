@@ -507,6 +507,19 @@ func (f *FS) readFile(ctx context.Context, n Node, file index.File, p []byte, of
 	return got, api.Errno(err)
 }
 
+// PastBudget reports whether reading a file in full could take more CDN
+// bytes than the traffic budget has left today. The Linux kernel's buffered
+// read path reports any failed read as EIO, so the FUSE front-end opens
+// such a file with direct I/O, where the reader gets EDQUOT.
+func (f *FS) PastBudget(ctx context.Context, n Node) bool {
+	room, ok := f.cache.Room()
+	if !ok {
+		return false
+	}
+	a, err := f.Getattr(ctx, n)
+	return err == nil && a.Size > room
+}
+
 func (f *FS) notFound(uuid string) {
 	if f.missing != nil {
 		go f.missing(uuid)

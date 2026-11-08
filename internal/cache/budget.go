@@ -114,6 +114,18 @@ func (b *Budget) allowPrefetch(n int64) bool {
 	return n <= b.limit-b.base-b.local-b.reserve
 }
 
+// Room is what the window has left; ok is false without a budget.
+func (c *Cache) Room() (room int64, ok bool) {
+	b := c.o.Budget
+	if b == nil {
+		return 0, false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.rollLocked()
+	return max(b.limit-b.base-b.local, 0), true
+}
+
 // give returns bytes taken for a fetch that failed or was not needed.
 func (b *Budget) give(n int64) {
 	if b == nil {

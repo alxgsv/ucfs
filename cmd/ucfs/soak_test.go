@@ -259,7 +259,8 @@ func (s *soak) live(project string) {
 		dir = "p5soak"
 	}
 	cache := t.TempDir()
-	global := []string{"--project", project, "--cache-dir", cache}
+	// Debug logging, so the run's log shows whether a key ever reaches it.
+	global := []string{"-v", "--project", project, "--cache-dir", cache}
 	s.m = mountFake(t, global, cache, "--views", "tree", "--sync-interval", "60s", "--traffic-budget", "50MB",
 		"--upload-metadata", "ucfs:test=1")
 	tree := filepath.Join(s.m.dir, "tree", dir)
