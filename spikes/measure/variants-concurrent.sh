@@ -17,7 +17,7 @@ up() {
 	"$bin" --cache-dir "$cache" mount "$mnt" >"$cache/mount.log" 2>&1 &
 	pid=$!
 	for _ in $(seq 100); do
-		"$bin" --cache-dir "$cache" status >/dev/null 2>&1 && break
+		"$bin" --cache-dir "$cache" status "$mnt" >/dev/null 2>&1 && break
 		sleep 0.2
 	done
 	o=$mnt/files/$(ls "$mnt/files" | grep -m1 "_$other\$")

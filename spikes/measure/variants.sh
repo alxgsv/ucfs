@@ -12,7 +12,7 @@ stem=${name%.*}
 
 now() { perl -MTime::HiRes=time -e 'printf "%.3f\n", time'; }
 counters() {
-	"$bin" --cache-dir "$cache" status --json | python3 -c '
+	"$bin" --cache-dir "$cache" status --json "$mnt" | python3 -c '
 import json, sys
 s = json.load(sys.stdin)[0]["cdn"]
 print(s["heads"], s["gets"], s["bytes"])'
@@ -40,7 +40,7 @@ cache=$(mktemp -d "$work/cache-var-XXXX")
 "$bin" --cache-dir "$cache" mount "$mnt" >"$cache/mount.log" 2>&1 &
 pid=$!
 for _ in $(seq 100); do
-	"$bin" --cache-dir "$cache" status >/dev/null 2>&1 && break
+	"$bin" --cache-dir "$cache" status "$mnt" >/dev/null 2>&1 && break
 	sleep 0.2
 done
 

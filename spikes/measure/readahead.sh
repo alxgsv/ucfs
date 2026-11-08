@@ -11,7 +11,7 @@ bin=$(cd "$(dirname "$0")/../.." && pwd)/bin/ucfs
 
 now() { perl -MTime::HiRes=time -e 'printf "%.3f\n", time'; }
 counters() {
-	"$bin" --cache-dir "$cache" status --json | python3 -c '
+	"$bin" --cache-dir "$cache" status --json "$mnt" | python3 -c '
 import json, sys
 s = json.load(sys.stdin)[0]
 print(s["cdn"]["bytes"], s["cache"]["fetched_demand"], s["cache"]["fetched_prefetch"])'
@@ -37,7 +37,7 @@ for ra in "$@"; do
 	"$bin" --cache-dir "$cache" mount --readahead "$ra" "$mnt" >"$cache/mount.log" 2>&1 &
 	pid=$!
 	for _ in $(seq 100); do
-		"$bin" --cache-dir "$cache" status >/dev/null 2>&1 && break
+		"$bin" --cache-dir "$cache" status "$mnt" >/dev/null 2>&1 && break
 		sleep 0.2
 	done
 	measure "cat 16 MB" cat "$mnt/files/$(pick ucfs-seq16.jpg)"

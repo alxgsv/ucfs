@@ -11,7 +11,10 @@ binaries and a pure-noise JPEG shrinks unlike a photo when resized. It is value 
 amplitude proportional to scale^0.3, saved at JPEG quality 95. That falloff was picked so the image compresses like a
 photograph. Its 1200 px WebP takes 0.12 B per pixel. A real 1000×667 stock photo among the fixtures takes 0.125 B per
 pixel as a WebP. A first try with smooth gradients and grain gave a 1200 px WebP of 12 KB, which would have overstated
-the saving, and was deleted.
+the saving, and was deleted. To make the file again, run
+[`spikes/photogen`](../spikes/photogen/main.go) as `go run ./spikes/photogen -beta 0.3 -q 95 -seed 1 -o hero.jpg`. On
+the Mac it reproduces the uploaded file byte for byte (MD5 `19cf6af4a965cc0272b2b3b7cec8c296`). Another architecture
+may round floating point differently and produce other bytes.
 
 Every run uses a fresh mount and an empty `--cache-dir`, which means a new index and an empty block cache. The
 scripts are [`spikes/measure/variants.sh`](../spikes/measure/variants.sh) and
