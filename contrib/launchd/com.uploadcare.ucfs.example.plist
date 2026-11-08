@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Mounts an Uploadcare project at login and keeps it mounted. Replace
+  /Users/YOU with your home directory and the ucfs path with `command -v ucfs`;
+  launchd expands neither ~ nor $HOME. See README.md next to this file.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.uploadcare.ucfs</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/bin/ucfs</string>
+		<string>mount</string>
+		<string>/Users/YOU/Uploadcare</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<!-- Restart after a failure, not after `ucfs umount`, which exits 0. -->
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>StandardOutPath</key>
+	<string>/Users/YOU/Library/Logs/ucfs.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/YOU/Library/Logs/ucfs.log</string>
+</dict>
+</plist>
