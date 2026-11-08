@@ -1,0 +1,252 @@
+# ucfs — Implementation plan (V1)
+
+Companion to [RESEARCH.md](RESEARCH.md), which holds the feasibility analysis, verified API/CDN facts and the
+namespace design. This document says what gets built, in which order, and how each phase is accepted.
+Effort figures are estimates for one engineer.
+
+## 1. Scope and decisions
+
+**Repository:** `github.com/alxgsv/ucfs`, private while experimental, checked out at `~/workspace/ucfs`. Each phase is a
+branch with a pull request to `main`; the phase's acceptance criteria are the PR's checklist.
+
+**V1 delivers** a daemon plus CLI, `ucfs`, that mounts one Uploadcare project as a read-mostly, write-once filesystem on
+macOS and Linux, with these views: `files/`, `files/<uuid>/-/…` variants, `tree/` (writable, metadata-backed), `by-date/`,
+`tags/`, `groups/`. Metadata is exposed as xattrs where the front-end supports them (Linux FUSE in V1).
+
+**Out of scope for V1:** Windows (WinFsp; nothing in the core should preclude it, but no code or CI for it),
+FUSE-T/cgofuse front-end on macOS (V1.1: brings xattrs and close semantics to macOS), FSKit and File Provider, webhook
+receiver, rclone backend, signed/authenticated CDN URLs, custom storages, conversion views, group creation,
+`local_copy` on `cp` of a variant, `.removed/` view.
+
+Decisions fixed up front:
+
+| Decision | Choice | Why |
+|---|---|---|
+| Language, toolchain | Go 1.26, `CGO_ENABLED=0` | Matches `uploadcare-go` and `uploadcare-cli`; static binaries; cross-compile for darwin/linux from one machine |
+| Repository and module path | `github.com/alxgsv/ucfs`, private for now, checkout `~/workspace/ucfs` | Personal repo while experimental; the module path equals the repo path, so going public needs no rename. A later move to the `uploadcare` org is a module-path change in `go.mod` and imports, nothing structural |
+| macOS front-end | Loopback NFSv3 server (`github.com/willscott/go-nfs`) mounted with the built-in `mount_nfs` | Zero install, no kext, works on managed Macs. Proven by rclone `nfsmount` |
+| Linux front-end | FUSE via `github.com/hanwen/go-fuse/v2` (pure Go) | No libfuse dependency, full semantics (close, xattrs, invalidation). NFS front-end also builds on Linux as a fallback |
+| Index | SQLite via `modernc.org/sqlite` | Pure Go; WAL gives concurrent readers; survives restarts |
+| API client | `github.com/uploadcare/uploadcare-go/v2` (`file`, `upload`, `metadata`, `tag`, `group`, `project`) with `RetryConfig` enabled | Already covers list, search, info, store/delete, local copy, base and multipart upload, metadata, tags, groups |
+| CLI framework | cobra, same conventions as `uploadcare-cli` | Familiar flags, `--json`, config file sharing |
+| Config | `~/.uploadcare/config.yaml` (CLI format), env `UPLOADCARE_PUBLIC_KEY`/`UPLOADCARE_SECRET_KEY`, flags | One credential store for CLI and mount |
+| Logging | `log/slog` | Standard library |
+
+## 2. Repository layout
+
+```
+cmd/ucfs/                      main; cobra commands: mount, umount, status, resolve, index, version
+internal/config/               credentials, project selection, cache and spool directories
+internal/api/                  thin layer over uploadcare-go: paged listing, info, search, metadata, tags, upload (base/multipart), delete, local copy; error → errno mapping
+internal/cdn/                  per-project CDN base, URL building, HEAD, ranged GET, variant operation grammar
+internal/index/                SQLite schema and migrations, full scan, incremental sync, removed sweep, group sync, queries
+internal/cache/                on-disk block cache, LRU eviction, singleflight, sequential detector, adaptive prefetch, traffic accounting
+internal/spool/                write spool, commit (upload), overwrite policy, alias table, upload journal
+internal/vfs/                  platform-neutral filesystem model: node ids, attrs, lookup/readdir/open/read/write/flush, xattrs, local-only shadow files
+internal/vfs/views/            files, variants, tree, bydate, tags, groups (one file each)
+internal/frontend/nfs/         go-nfs Handler (stable file handles), billy.Filesystem adapter, mount_nfs/umount driver (darwin, linux)
+internal/frontend/fuse/        go-fuse adapter (linux build tag)
+internal/ctl/                  unix-socket control API used by `ucfs status`
+internal/fake/                 httptest doubles for REST, Upload API and CDN used by tests
+testdata/                      golden files, fixtures
+docs/                          mount options, troubleshooting, Finder notes
+Makefile  .goreleaser.yaml  .github/workflows/ci.yml  CLAUDE.md  AGENTS.md
+```
+
+## 3. Phases
+
+### Phase 0: Skeleton and de-risking spikes (≈ 2 days)
+
+Get a binary, a config, an index, and answers to the open questions that could change the design.
+
+1. `go.mod`, `cmd/ucfs/main.go`, root cobra command with global flags, `ucfs version`, `Makefile` (`build`, `test`, `lint`, `run`).
+2. `internal/config/`: read the CLI config file and env; pick project; derive cache dir (`~/Library/Caches/ucfs/<pubkey>` on macOS, `$XDG_CACHE_HOME/ucfs/<pubkey>` on Linux).
+3. `internal/api/` list wrapper and `internal/index/` schema; `ucfs index sync` performs a full scan of the configured project into SQLite and prints counts.
+4. Spike A, macOS mount: a static go-nfs export mounted with `mount_nfs` as a normal user on macOS 27. Record the exact option string that works (`port`, `mountport`, `nfsvers=3`, `tcp`, `locallocks`, `rsize`/`wsize` 1 MiB, `nfc`, `soft`/`hard`, `noresvport`) and whether `sudo` is needed. If non-root mounting is impossible, V1 ships a one-time `sudo` setup step; the design does not change.
+5. Spike B, concurrency: two readers on different files against the static export with `ConcurrentHandlers` 1 and 128; confirm the stall disappears.
+6. Spike C, Finder: open the static export in Finder, record what it reads and writes (`.DS_Store`, `._*`, thumbnails) with a request log.
+7. Spike D, upload semantics against `uploadcare-go-test`: does direct upload preserve `original_filename` byte-for-byte (spaces, Unicode NFC/NFD, non-ASCII)? What happens with an empty file? Does `UPLOADCARE_STORE=1` behave as expected when `autostore_enabled` is true?
+8. Spike E, scan cost: full scan of the largest internal test project available at 1000/page; record duration and any 429s.
+
+Result: `ucfs version`, `ucfs index sync`, and a short `docs/spikes.md` with the answers. Every later phase assumes them.
+
+### Phase 1: Read-only mount on macOS and Linux (≈ 4 days)
+
+One view end to end through both front-ends.
+
+9. `internal/vfs/`: node model (`NodeID` = 64-bit hash of view + uuid + ops/path), attrs from the index, `Lookup`, `ReadDir` with cursor, `Open`/`ReadAt`/`Release`, per-node attribute TTL hints (long for immutable entries, short for directories).
+10. `views/files`: `files/<uuid>_<original_filename>`; `files/<uuid>/` resolvable but not listed (reserved for Phase 2 variants).
+11. `internal/cdn/`: CDN base from public key (same derivation as the CLI), `HEAD`, ranged `GET`, ETag capture.
+12. `internal/cache/`: 1 MiB blocks on disk, size-bounded LRU, singleflight per (uuid, ops, block), sequential detector with prefetch window 1 → 16 MiB, per-mount byte counters.
+13. `internal/frontend/nfs/`: `nfs.Handler` with stable, self-describing file handles (version, kind, uuid, ops/path hash) instead of the path-LRU helper; billy adapter over `vfs`; `ConcurrentHandlers` 128; mount/unmount driver using the Spike A option string.
+14. `internal/frontend/fuse/` (linux): go-fuse node adapter; `MaxReadAhead` and `MaxWrite` 1 MiB; entry/attr timeouts from vfs hints.
+15. `ucfs mount <dir> --read-only` (default on in this phase), `ucfs umount <dir>`, `ucfs status` (counters over the control socket).
+16. Index sync loop: incremental listing every 30 s from the stored cursor; `removed=true` sweep every 10 min; CDN 404 marks a file removed and refreshes its info.
+
+Acceptance: on this Mac without installing anything, `ls`, `cat`, `open` an image in Preview and `rsync` a subset out all
+work; two shells reading different files concurrently show no mutual stall; `ucfs status` shows CDN bytes close to the
+sum of file sizes read, and a `ls -lR` costs zero CDN bytes. The same on a Linux VM through FUSE.
+
+### Phase 2: Variants as paths (≈ 2 days)
+
+17. `internal/cdn/ops.go`: static table of URL API operation names (from the URL API docs and the CLI's embedded
+    `url-api` reference); unknown operation → `ENOENT`.
+18. `views/variants`: `files/<uuid>/-/<op>/<args>/…/<name>`; operation components are directories; `readdir` on one
+    lists a single default entry named after the original file (extension adjusted for `format`); the leaf is a file
+    whose size comes from one `HEAD`, cached in the `variants` table.
+19. Reads via the same block cache keyed by (uuid, ops); variant blocks carry a TTL because their ETag is weak.
+20. CDN 400 on a variant maps to `EINVAL` on open, with the CDN message in the log.
+
+Acceptance: `cp files/<uuid>/-/resize/1200x/-/format/webp/hero.webp .` produces the same bytes as `curl` of the URL;
+`stat` on a never-seen variant costs exactly one `HEAD`; a second `stat` costs nothing.
+
+### Phase 3: Writes (≈ 5 days)
+
+21. `internal/spool/`: spool files under the cache dir; `Create`/`WriteAt`/`Truncate(0)`; commit = upload with
+    `UPLOADCARE_STORE=1`, part filename = written name (`original_filename`), base upload ≤ 100 MB, multipart above.
+22. Commit triggers: FUSE `Flush` (blocking, error returned to the writer); NFS `COMMIT` or 3 s idle after the last
+    `WRITE`. Zero-length files stay local until written or removed (documented limitation).
+23. `views/tree`: `tree/<path>/<name>` from metadata key `ucfs:path`; `mkdir`/`rmdir` via `tree_dirs`; `rename` of an
+    uploaded file = one metadata `PUT`; directory rename = N metadata updates with a warning above 1000 entries; files
+    without `ucfs:path` appear under `tree/_inbox/`.
+24. Overwrite policy `--on-overwrite=replace|keep` (default `replace`: upload new, copy metadata and tags, soft-delete
+    old, update index and aliases).
+25. `unlink` → `DELETE /files/{uuid}/storage/`; aliases in `files/` for written names with TTL; `.ucfs/uploads.log`
+    journal (time, path, uuid, size, mime).
+26. Local-only shadow files: `.DS_Store`, `._*`, `.Spotlight-V100`, `.fseventsd`, `.Trashes`, `.TemporaryItems` are
+    stored in the cache dir and never uploaded; `.metadata_never_index` always exists at the root.
+27. Crash safety: spools that were being uploaded are retried on the next `ucfs mount`; `ucfs spool list|retry|drop`.
+
+Acceptance: `cp photo.jpg tree/photos/` leaves `tree/photos/photo.jpg` with `original_filename` `photo.jpg` and a
+journal line; saving from TextEdit and from `vim` (temp file + rename) works in `tree/`; `rm` soft-deletes; Finder
+copy of a folder with 50 images uploads 50 files and zero sidecars; a killed daemon mid-upload resumes on restart.
+
+### Phase 4: Metadata, tags, groups, dates (≈ 3 days)
+
+28. xattrs on Linux FUSE: read-only `user.uc.uuid`, `.cdn_url`, `.mime`, `.md5`, `.width`, `.height`, `.stored`,
+    `.tags`; read-write `user.uc.meta.<key>` → metadata API (50-key, 64/512-char limits mapped to `E2BIG`/`ENOSPC`).
+29. `views/tags` (`tags/<tag>/<uuid>_<name>`), `views/groups` (`groups/<group-uuid>/<index>_<name>`),
+    `views/bydate` (`by-date/YYYY/MM/DD/<uuid>_<name>`); group sync via `GET /groups/` cursor.
+30. `ucfs resolve <path>` prints uuid, CDN URL and metadata for any path on the mount (via the control socket).
+31. Lazy metadata refresh: `getxattr` re-fetches file info when the index entry is older than 5 min.
+32. `--views` flag selects which views are mounted (default `files,tree,by-date`; `tags` and `groups` opt-in).
+
+Acceptance: `setfattr -n user.uc.meta.camera -v Canon tree/x.jpg` is visible in the dashboard; `tags/approved/` lists
+exactly the search result for `tags.all=[approved]`.
+
+### Phase 5: Hardening (≈ 3 days)
+
+33. Traffic budget `--traffic-budget` (bytes per day); reads beyond it fail with `EDQUOT` and `ucfs status` says so.
+34. Error → errno table applied everywhere: 404 `ENOENT`, 401/403 `EACCES`, 429 after retries `EAGAIN`, 5xx/network
+    `EIO`, unsupported `EOPNOTSUPP`/`EROFS`, bad variant `EINVAL`.
+35. Backpressure: bounded in-flight CDN requests per mount (default 32) with a fair queue, so a bulk `rsync` cannot
+    starve interactive `stat`/`readdir`.
+36. Security defaults: `nosuid,nodev`, no `allow_other`, config file permission check, secrets never logged, cache dir
+    `0700`.
+37. Benchmarks in CI: cold `cat` 5 MB, `ls -l` 10 000 entries, two concurrent variant readers (p95 of the second
+    reader unchanged by the first).
+38. Soak: 24 h mount with Finder open and a sync loop running against the test project; no growth in goroutines,
+    file descriptors or cache beyond the configured size.
+
+### Phase 6: Packaging and docs (≈ 3 days)
+
+39. Decide where the public repo lives (`alxgsv/ucfs` or the `uploadcare` org), make it public, and name the Homebrew tap to match.
+40. `.goreleaser.yaml`: darwin arm64/amd64, linux amd64/arm64; Homebrew tap formula; `install.sh` in the style of the CLI.
+41. launchd plist and systemd unit examples for persistent mounts; `ucfs mount --daemon`.
+42. `docs/`: mount options, Finder and Spotlight notes, cost guidance (what pulls CDN traffic), semantics table
+    (what works, what returns `EOPNOTSUPP`), troubleshooting.
+43. `CLAUDE.md`/`AGENTS.md` with build, test and live-test instructions.
+
+Result: `brew install alxgsv/tap/ucfs && ucfs mount ~/uc` on a fresh Mac (tap name follows step 39).
+
+## 4. Cross-cutting specifications
+
+### 4.1 Index schema
+
+```sql
+files     (uuid TEXT PRIMARY KEY, name TEXT, size INTEGER, mime TEXT, is_image INTEGER, is_ready INTEGER,
+           stored INTEGER, removed INTEGER, uploaded_at INTEGER, stored_at INTEGER, removed_at INTEGER,
+           md5 TEXT, width INTEGER, height INTEGER, metadata TEXT /*json*/, tags TEXT /*json*/,
+           tree_path TEXT, info_refreshed_at INTEGER);
+           -- indexes: uploaded_at, name, tree_path, removed
+variants  (uuid TEXT, ops TEXT, size INTEGER, mime TEXT, etag TEXT, checked_at INTEGER, PRIMARY KEY (uuid, ops));
+groups    (uuid TEXT PRIMARY KEY, created_at INTEGER, files TEXT /*json array of uuids*/);
+aliases   (view TEXT, name TEXT, uuid TEXT, expires_at INTEGER, PRIMARY KEY (view, name));
+tree_dirs (path TEXT PRIMARY KEY, created_at INTEGER);
+shadow    (path TEXT PRIMARY KEY, blob_ref TEXT, size INTEGER, mtime INTEGER);
+sync_state(key TEXT PRIMARY KEY, value TEXT);  -- list cursor, last full scan, last removed sweep, groups cursor
+```
+
+### 4.2 Sync algorithm
+
+- Full scan: `GET /files/?ordering=datetime_uploaded&limit=1000&from=<cursor>` until exhausted; upsert; cursor =
+  last `datetime_uploaded` (re-fetch of equal timestamps is deduplicated by uuid).
+- Incremental: same call from the cursor every `--sync-interval` (default 30 s).
+- Removals: `removed=true` listing every 10 min marks `removed`; a CDN 404 on read does the same immediately.
+- Metadata and tags changed by other clients are not visible in listings: refreshed lazily on `getxattr` (5 min TTL)
+  and by `ucfs index refresh <uuid>`.
+- Groups: `GET /groups/?ordering=datetime_created&from=<cursor>` every 10 min.
+- Search API is used only by `ucfs resolve --search` and by tree repair, never on the request path.
+
+### 4.3 Node ids and NFS file handles
+
+`NodeID` is a 64-bit FNV-1a hash of `(view, uuid, ops-or-path)`; collisions are detected at insert and resolved by
+rehashing with a salt stored in the index. NFS file handles are self-describing (`version:1 byte, kind:1 byte,
+uuid:16 bytes, hash:8 bytes`), so a restarted daemon serves old handles without a path cache and never returns
+`ESTALE` for files that still exist.
+
+### 4.4 Read path
+
+Open → sequential detector per handle → block cache (`<cache>/blocks/<uuid-or-hash>/<blockno>`) → singleflight →
+ranged `GET`. Prefetch window starts at 1 MiB and doubles while reads stay sequential, up to 16 MiB, bounded by the
+traffic budget. Originals never revalidate; variants expire after 24 h.
+
+### 4.5 Write path
+
+Create → spool → writes → commit trigger (FUSE `Flush`, NFS `COMMIT`/idle) → upload → index upsert → alias and
+journal → spool removal. Replacement of an existing name follows `--on-overwrite`. Upload failures return `EIO` on
+`Flush`; on NFS they are logged and the spool is kept for `ucfs spool retry`.
+
+### 4.6 Mount options (to be confirmed by Spike A)
+
+macOS: `mount_nfs -o port=P,mountport=P,nfsvers=3,tcp,locallocks,rsize=1048576,wsize=1048576,nfc,soft,intr,
+acregmax=3600,acdirmax=5 localhost:/ <dir>`. Linux FUSE: `fsname=ucfs`, `noatime`, `max_read=1048576`, no `allow_other`.
+
+## 5. Testing strategy
+
+- Unit tests for `vfs`, `cache`, `spool`, `index` against `internal/fake` (REST with cursor pagination, metadata,
+  storage, search; Upload with base and multipart; CDN with deterministic bytes, `Range` and `HEAD` for originals and
+  variants).
+- Front-end tests: Linux FUSE mounted in CI (ubuntu runner with `fuse3`); macOS NFS mounted on a macOS runner when
+  Spike A shows non-root mounting works, otherwise run locally and documented.
+- Live tests gated by `UCFS_LIVE=1` against `uploadcare-go-test`: upload, read back, metadata round trip, delete.
+- Golden files for `ucfs status --json` and `ucfs resolve --json`.
+- Benchmarks from Phase 5 run on every PR and compared against the previous run.
+
+## 6. Risks and where they are retired
+
+| Risk | Phase that answers it | Fallback |
+|---|---|---|
+| Non-root NFS mount on macOS | 0 (Spike A) | one-time `sudo` setup documented |
+| Unpublished rate limits during full scans | 0 (Spike E) | adaptive page delay, resume from cursor |
+| `original_filename` mangling | 0 (Spike D) | store the written name in `ucfs:name` metadata and display it |
+| Finder/Spotlight traffic | 0 (Spike C), 3, 5 | shadow files, `.metadata_never_index`, traffic budget |
+| NFS has no close event | 3 | idle commit; FUSE-T front-end in V1.1 for strict semantics |
+| No xattrs over NFSv3 on macOS | 4 | `ucfs resolve` and the CLI cover metadata on macOS until V1.1 |
+| go-nfs maturity ("minimally tested") | 1, 5 (soak) | fork and fix; rclone uses the same library in production |
+| Stale index after foreign writes | 1, 4 | 30 s sync, lazy refresh, `ucfs index refresh` |
+
+## 7. Strategic notes
+
+**Do Phase 0 spikes before writing the VFS.** Spike A decides the macOS story and Spike D decides the naming story;
+both are cheap and both can change code shape.
+
+**Build the NFS front-end first, FUSE second.** NFS is the one that runs on the development machine and the one with
+the awkward semantics; FUSE is the easy port.
+
+**Keep the core front-end-agnostic.** Every operation lives in `internal/vfs` and is tested against the fakes without
+a mount; front-ends are thin adapters. That is also what keeps Windows and FUSE-T possible later without touching the
+core.
+
+**Measure traffic from day one.** The byte counter in Phase 1 is what makes the Finder findings, the prefetch tuning
+and the budget feature possible; it is not a polish item.
