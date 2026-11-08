@@ -75,10 +75,10 @@ The answers are in [docs/spikes.md](docs/spikes.md); the items below already ref
 
 One view end to end through both front-ends.
 
-9. `internal/vfs/`: node model (`NodeID` = 64-bit hash of view + uuid + ops/path), attrs from the index, `Lookup`, `ReadDir` with cursor, `Open`/`ReadAt`/`Release`, per-node attribute TTL hints (long for immutable entries, short for directories). `Lookup` matches names under Unicode NFC: the server keeps NFC and NFD names distinct, and the `nfc` mount option makes macOS send NFC (Spike D).
-10. `views/files`: `files/<uuid>_<original_filename>`; `files/<uuid>/` resolvable but not listed (reserved for Phase 2 variants). Server names can contain `/` and NUL (multipart keeps them), so the view maps those to safe characters.
+9. `internal/vfs/`: node model (`NodeID` = 64-bit hash of view + uuid + ops/path), attrs from the index, `Lookup`, `ReadDir` with cursor, `Open`/`ReadAt`/`Release`, per-node attribute TTL hints (long for immutable entries, short for directories). `Lookup` matches names under Unicode NFC: the server keeps NFC and NFD names distinct, and with the `nfc` mount option macOS sends NFC in LOOKUP even for a name it listed as NFD (Spike D).
+10. `views/files`: `files/<uuid>_<original_filename>`; `files/<uuid>/` resolvable but not listed (reserved for Phase 2 variants). Server names can contain `/` (multipart keeps it, Spike D), so the view maps `/`, and NUL defensively, to safe characters.
 11. `internal/cdn/`: CDN base from public key (same derivation as the CLI), `HEAD`, ranged `GET`, ETag capture.
-12. `internal/cache/`: 1 MiB blocks on disk, size-bounded LRU, singleflight per (uuid, ops, block), sequential detector with prefetch window 1 → 16 MiB, per-mount byte counters. NFS has no open handle (go-nfs re-opens the file for every READ), so the detector is keyed per file and tracks several streams, so two readers of one file do not reset each other's window.
+12. `internal/cache/`: 1 MiB blocks on disk, size-bounded LRU, singleflight per (uuid, ops, block), sequential detector with prefetch window 1 → 16 MiB, per-mount byte counters. NFS has no open handle (go-nfs re-opens the file for every READ), so the detector is keyed per file and tracks several streams, so two readers of one file do not reset each other's window. Prefetch fetches the blocks ahead concurrently: with `readahead=0` the client sends one READ at a time per reader (Spike A).
 13. `internal/frontend/nfs/`: `nfs.Handler` with stable, self-describing file handles (version, kind, uuid, ops/path hash) instead of the path-LRU helper; billy adapter over `vfs`; `ConcurrentHandlers` 128; mount/unmount driver using the Spike A option string (§4.6). go-nfs calls `Lstat` on almost every RPC and `Open`+`Stat` on every READ, so both must be index-only. `HandleLimit` must be large because READDIR caps a reply at `HandleLimit()/2` entries, and the handler implements go-nfs's verifier cache so a large directory is not re-listed for every READDIR page.
 14. `internal/frontend/fuse/` (linux): go-fuse node adapter; `MaxReadAhead` and `MaxWrite` 1 MiB; entry/attr timeouts from vfs hints.
 15. `ucfs mount <dir> --read-only` (default on in this phase; on macOS it adds `rdonly`, which stops Finder's `.DS_Store` writes and SETATTRs, Spike C), `ucfs umount <dir>`, `ucfs status` (counters over the control socket).
@@ -216,8 +216,9 @@ journal → spool removal. Replacement of an existing name follows `--on-overwri
 
 macOS, run as the user: `mount_nfs -o port=P,mountport=P,vers=3,tcp,locallocks,noresvport,rsize=1048576,
 wsize=1048576,readahead=0,nfc,soft,intr,acregmax=3600,acdirmax=5,nobrowse[,rdonly] 127.0.0.1:/ <dir>`. Without
-`rsize`/`wsize` the client negotiates 32 KiB. `readahead=0` because at 1 MiB blocks the client's default read-ahead
-turns a 4 KiB read into 16 MiB of traffic, and the daemon prefetches by itself. `127.0.0.1`, not `localhost`, which can
+`rsize`/`wsize` the client negotiates 32 KiB. `readahead=0` is a traffic choice: at 1 MiB blocks the client's default
+read-ahead turns a 4 KiB read into 16 MiB of traffic. It also makes cold sequential speed depend entirely on daemon
+prefetch, so Phase 1 re-measures it against a read-ahead of 2–4. `127.0.0.1`, not `localhost`, which can
 resolve to `::1`. `nobrowse` keeps the mount out of the Finder sidebar; `rdonly` while read-only. Linux FUSE:
 `fsname=ucfs`, `noatime`, `max_read=1048576`, no `allow_other`.
 
@@ -239,7 +240,7 @@ resolve to `::1`. `nobrowse` keeps the mount out of the Finder sidebar; `rdonly`
 | Non-root NFS mount on macOS | Retired in 0 (Spike A): works as the user | — |
 | Unpublished rate limits during full scans | Open after 0 (Spike E ran on a 33-file project; one request, no 429) | adaptive page delay, resume from cursor (implemented) |
 | `original_filename` mangling | Retired in 0 (Spike D) except names with `\` (base upload strips through the last `\` or `/`) | store the written name in `ucfs:name` metadata and display it; `EINVAL` until then |
-| Finder/Spotlight traffic | 0 (Spike C), 3, 5. Spotlight is off on NFS mounts by default; Finder icon view reads every image in full, `.ql_disablethumbnails` does not stop it | `nobrowse`, `rdonly`, `readahead=0`, shadow files, traffic counter and budget |
+| Finder/Spotlight traffic | 0 (Spike C), 3, 5. Spotlight is off on NFS mounts by default; Finder icon view read every test image in full (JPEGs without an embedded thumbnail, also with `readahead=0`), and `.ql_disablethumbnails` does not stop it | `nobrowse`, `rdonly`, `readahead=0`, shadow files, traffic counter and budget |
 | NFS has no close event | 3 | idle commit; FUSE-T front-end in V1.1 for strict semantics |
 | No xattrs over NFSv3 on macOS | 4 | `ucfs resolve` and the CLI cover metadata on macOS until V1.1 |
 | go-nfs maturity ("minimally tested") | 1, 5 (soak) | fork and fix; rclone uses the same library in production |

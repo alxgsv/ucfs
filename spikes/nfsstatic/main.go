@@ -36,6 +36,7 @@ func main() {
 	slowDelay := flag.Duration("slow-delay", 400*time.Millisecond, "delay per ReadAt on files named slow*")
 	readOnly := flag.Bool("read-only", false, "reject writes")
 	trace := flag.Bool("trace", false, "go-nfs trace log (every RPC)")
+	logStats := flag.Bool("log-stats", false, "log successful stat and lstat calls too")
 	flag.Parse()
 	if *root == "" {
 		flag.Usage()
@@ -58,7 +59,7 @@ func main() {
 		os.Exit(1)
 	}
 	st := &stats{read: map[string]int64{}, written: map[string]int64{}, ops: map[string]int{}}
-	fs := &logFS{Filesystem: osfs.New(*root, osfs.WithBoundOS()), slowDelay: *slowDelay, readOnly: *readOnly, st: st}
+	fs := &logFS{Filesystem: osfs.New(*root, osfs.WithBoundOS()), slowDelay: *slowDelay, readOnly: *readOnly, logStats: *logStats, st: st}
 	srv := &nfs.Server{
 		Handler:            nfshelper.NewCachingHandler(nfshelper.NewNullAuthHandler(fs), 1<<16),
 		ConcurrentHandlers: *concurrent,
@@ -129,6 +130,7 @@ type logFS struct {
 	billy.Filesystem
 	slowDelay time.Duration
 	readOnly  bool
+	logStats  bool
 	st        *stats
 }
 
@@ -180,7 +182,7 @@ func (f *logFS) OpenFile(name string, flag int, perm os.FileMode) (billy.File, e
 func (f *logFS) Stat(name string) (os.FileInfo, error) {
 	fi, err := f.Filesystem.Stat(name)
 	f.st.op("stat", name, 0)
-	if err != nil {
+	if err != nil || f.logStats {
 		f.logOp("stat", name, err)
 	}
 	return fi, err
@@ -189,7 +191,7 @@ func (f *logFS) Stat(name string) (os.FileInfo, error) {
 func (f *logFS) Lstat(name string) (os.FileInfo, error) {
 	fi, err := f.Filesystem.Lstat(name)
 	f.st.op("lstat", name, 0)
-	if err != nil {
+	if err != nil || f.logStats {
 		f.logOp("lstat", name, err)
 	}
 	return fi, err

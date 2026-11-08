@@ -115,6 +115,7 @@ func (c clients) probe(ctx context.Context, ledger, only string) error {
 		{label: "store=auto", name: "storeauto.txt", store: upload.ToStoreAuto},
 		{label: "multipart-nfd", name: "multi cafe\u0301 🙂 \"q\".bin", data: big, multi: true},
 		{label: "multipart-bs", name: `multi back\slash.bin`, data: big, multi: true},
+		{label: "multipart-slash", name: "multi dir/sub.bin", data: big, multi: true},
 	}
 	fmt.Printf("%-14s %-6s %-9s %-7s %-9s %s\n", "case", "kept", "is_ready", "stored", "size", "server original_filename (upload API filename)")
 	for _, tc := range cases {

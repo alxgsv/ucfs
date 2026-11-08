@@ -32,9 +32,12 @@ mount_nfs -o port=P,mountport=P,vers=3,tcp,locallocks,noresvport,rsize=1048576,w
 - Read-ahead matters for traffic. At `rsize=1048576` the default read-ahead of 16 blocks turns `head -c 4096` into
   16 MiB of READs, and `file(1)` into 16 MiB as well. With `readahead=0`, `head -c 4096` is one 1 MiB READ and `file(1)`
   two. A 4 KiB `dd` at a 4 MB offset was one READ either way.
+- Read-ahead also carries throughput. With `readahead=0` the client issues one READ at a time per reader:
+  `cat slow.bin` (16 READs of 400 ms each) took 6.49 s, against 1.08 s with the default read-ahead (B).
 
-**Consequence.** No `sudo` setup step in V1. PLAN §4.6 now has this option string, including `readahead=0`, because
-the daemon's own sequential detector does the prefetching. Read-only mounts add `rdonly` (see C). The macOS NFS
+**Consequence.** No `sudo` setup step in V1. PLAN §4.6 now has this option string. `readahead=0` is a traffic choice:
+cold sequential speed then depends entirely on the daemon's own prefetch, which must fetch blocks ahead concurrently.
+Phase 1 re-measures it against a small read-ahead (2–4). Read-only mounts add `rdonly` (see C). The macOS NFS
 front-end can be mounted in CI on a macOS runner as the user.
 
 ## B. Concurrency: `ConcurrentHandlers` 1 versus 128
@@ -45,7 +48,7 @@ front-end can be mounted in CI on a macOS runner as the user.
 400 ms) and `fast.bin` (16 MiB, no delay). Start `cat slow.bin`, after 1 s run `stat photos/photo-0.jpg` and then
 `cat fast.bin` in a second process. Fresh server and mount for every run, so no client cache carries over.
 
-**Result.** Two runs each, identical to 10 ms:
+**Result.** Two runs at each setting, within 5 ms of each other:
 
 | ConcurrentHandlers | `stat` of an unrelated file | `cat fast.bin` (16 MiB) | `cat slow.bin` |
 |---|---|---|---|
@@ -74,8 +77,11 @@ the mount, a check of `.ql_disablethumbnails`, and a read-only mount with a 16 M
   `._.`. It creates and writes `.DS_Store` (6 KiB) and `._.DS_Store` (4 KiB AppleDouble) at the root. That is 15 LOOKUP,
   15 GETATTR, 10 FSSTAT, 10 ACCESS, 3 CREATE, 3 WRITE and 1 READDIRPLUS.
 - Opening `photos/` in icon view: **every image is read in full** for thumbnails, 7 of 7. On a writable mount each is
-  then followed by a SETATTR of its times. On the read-only mount, the 16 MB JPEG was read completely (16 parallel
-  1 MiB READs, out of order).
+  then followed by a SETATTR of its times.
+- The same holds for large images, independent of client read-ahead. A fresh 16 MB JPEG on a `rdonly,readahead=0`
+  mount was read to the last byte (16,310,483 bytes in sequential 256 KiB and 1 MiB READs). The fixtures are
+  Go-encoded JPEGs with no embedded EXIF thumbnail, so this is the worst case. Camera JPEGs with an embedded thumbnail
+  were not tested.
 - A `.ql_disablethumbnails` file at the root does not stop it. Six fresh images were still read in full.
 - `rdonly` stops all writes: no `.DS_Store`, no `._.DS_Store`, no SETATTR. Reads are unchanged.
 - `cp` of any file creates an AppleDouble sidecar `._<name>`, even when the source has no user xattrs, because macOS 27
@@ -93,8 +99,9 @@ the mount, a check of `.ql_disablethumbnails`, and a read-only mount with a 16 M
 
 - Mount with `rdonly` while `--read-only` is in effect (Phase 1).
 - Use `nobrowse` by default so the mount does not appear in the Finder sidebar unasked.
-- Finder icon view of a directory costs the full size of every image in it. No marker file prevents that, so the
-  traffic counter (Phase 1) and the traffic budget (Phase 5) are the controls. Document it in the cost guidance.
+- Finder icon view of a directory costs up to the full size of every image in it. No marker file and no mount option
+  prevents that, so the traffic counter (Phase 1) and the traffic budget (Phase 5) are the controls. Document it in
+  the cost guidance.
 - Phase 3 must absorb `._*` and `.DS_Store` locally, as planned. It must also accept a truncate to the current length
   as a no-op, because `cp` issues one after every write.
 - `Lstat`/`Open` in the NFS adapter must be index-only and cheap.
@@ -105,8 +112,8 @@ the mount, a check of `.ql_disablethumbnails`, and a read-only mount with a 16 M
 `UPLOADCARE_STORE=1` behave when `autostore_enabled` is true?
 
 **Method.** Base upload (`POST /base/`) through uploadcare-go, `ToStore` `1` unless noted, metadata `ucfs:test=1`.
-Each file was polled through `GET /files/{uuid}/` until `is_ready`, and `original_filename` compared as bytes. Two
-cases went through multipart upload (11 MiB). Every uuid was written to a ledger as it was created, then deleted and
+Each file was polled through `GET /files/{uuid}/` until `is_ready`, and `original_filename` compared as bytes. Three
+cases went through multipart upload (11 MiB each). Every uuid was written to a ledger as it was created, then deleted and
 verified as removed. Before and after, the project lists the same 33 files and none carries `ucfs:test`.
 
 **Result.** The project has `autostore_enabled=true`.
@@ -121,9 +128,10 @@ verified as removed. Before and after, the project lists the same 33 files and n
 | `dir/sub.txt` (base) | **no**: `sub.txt` |
 | `multi café 🙂 "q".bin` NFD (multipart) | yes |
 | `multi back\slash.bin` (multipart) | yes |
+| `multi dir/sub.bin` (multipart) | yes, `/` included |
 
 - Base upload keeps only what follows the last `\` or `/`. This is IE-style path stripping of the `Content-Disposition`
-  filename on the server. Multipart sends the name as a plain form field and keeps it.
+  filename on the server. Multipart sends the name as a plain form field and keeps it, `/` included.
 - The Upload API's own `filename` field is a sanitised form: `[A-Za-z0-9._]` only, and `noroot.txt` for an all
   non-ASCII name. Never use it.
 - Empty file: accepted, `is_ready`, stored, size 0.
@@ -137,10 +145,16 @@ verified as removed. Before and after, the project lists the same 33 files and n
   planned.
 - A written name containing `\` must not go through base upload as-is. Phase 3 rejects such names with `EINVAL` until
   it implements the `ucfs:name` fallback from the risk table.
-- Names are stored in whatever normalisation the client sent. The `nfc` mount option makes the macOS client send NFC
-  in LOOKUP and CREATE, so an NFD name uploaded by another client would be listed but fail to open. Phase 1 lookups
-  must match names under NFC. Phase 1 must also map `/` and NUL in server names, because multipart can store names
-  that are not valid path components.
+- Names are stored in whatever normalisation the client sent. Measured on the rig with an NFD-named file
+  (`cafe` + U+0301):
+  - With `nfc`, `ls` shows the NFD bytes, but opening that very name sends NFC (`c3 a9`) in LOOKUP. Opening by the
+    NFC name also sends NFC.
+  - Without `nfc`, the client sends the bytes it was given.
+  - The open succeeded in all four cases only because the export sits on APFS, which matches either form.
+
+  ucfs keeps `nfc`, so new uploads from macOS get NFC names, and Phase 1 lookups must match names under NFC.
+  Otherwise NFD names uploaded by other clients would be listed but fail to open.
+- Phase 1 must map `/` in server names, because multipart stores it, and NUL defensively.
 - Empty files are uploadable, so the zero-length limitation in Phase 3 is an NFS-semantics choice, not an API limit.
 
 ## E. Scan cost
