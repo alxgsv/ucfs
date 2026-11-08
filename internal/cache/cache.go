@@ -267,6 +267,23 @@ func (c *Cache) store(id blockID, data []byte) error {
 	return nil
 }
 
+// Put stores an object's bytes as blocks, as a written file has them before
+// the CDN serves them: reading it back then costs no traffic.
+func (c *Cache) Put(k Key, r io.ReaderAt, size int64) error {
+	obj := objName(k)
+	buf := make([]byte, BlockSize)
+	for n := int64(0); n*BlockSize < size; n++ {
+		got, err := r.ReadAt(buf[:min(BlockSize, size-n*BlockSize)], n*BlockSize)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		if err := c.store(blockID{obj, n}, buf[:got]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (c *Cache) evictLocked() {
 	for c.used > c.o.MaxBytes && c.lru.Len() > 0 {
 		el := c.lru.Back()
