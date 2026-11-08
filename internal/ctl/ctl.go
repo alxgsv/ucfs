@@ -260,10 +260,14 @@ func (s *Server) Close() error {
 	return err
 }
 
+// client is a client for one request. Each call makes a new transport, so
+// a connection kept alive would outlive it in an idle pool nothing reuses:
+// a process that asks for the status every few seconds would gather one
+// connection, and the daemon one goroutine, per request.
 func client(path string) *http.Client {
 	return &http.Client{
 		Timeout: 5 * time.Second,
-		Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		Transport: &http.Transport{DisableKeepAlives: true, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			var d net.Dialer
 			return d.DialContext(ctx, "unix", path)
 		}},
