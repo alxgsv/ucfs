@@ -15,9 +15,9 @@ type Source interface {
 	Info(ctx context.Context, uuid string) (api.File, error)
 }
 
-// Loop keeps a mounted index current: incremental listing every Interval,
-// a removed sweep and a group sync every SweepEvery, and refreshes after
-// CDN 404s.
+// Loop keeps a mounted index current: an incremental listing right away
+// and then every Interval, a removed sweep and a group sync every
+// SweepEvery, and refreshes after CDN 404s. Failed syncs back off.
 type Loop struct {
 	Index      *Index
 	Source     Source
@@ -28,22 +28,29 @@ type Loop struct {
 	// Changed runs after any update that changed the index.
 	Changed func()
 
-	mu      sync.Mutex
-	last    time.Time
-	lastErr error
+	mu       sync.Mutex
+	last     time.Time
+	lastErr  error
+	failures int
+	next     time.Time
 }
 
+// maxBackoff caps the wait after failed syncs: it doubles with every
+// failure in a row, so a project whose API access was denied is asked
+// every 10 minutes rather than every Interval.
+const maxBackoff = 10 * time.Minute
+
 func (l *Loop) Run(ctx context.Context) {
-	tick := time.NewTicker(l.Interval)
-	defer tick.Stop()
-	// The zero time makes the first tick sweep, so a new mount soon drops
+	// The zero time makes the first sync sweep, so a new mount soon drops
 	// files removed while nothing was mounted.
 	var lastSweep time.Time
+	timer := time.NewTimer(0)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-tick.C:
+		case <-timer.C:
 		}
 		res, err := l.Index.Sync(ctx, l.Source, false)
 		changed := res.Added > 0
@@ -59,27 +66,55 @@ func (l *Loop) Run(ctx context.Context) {
 				slog.Debug("group sync", "added", n, "err", err)
 			}
 		}
-		l.record(err)
-		if err != nil && ctx.Err() == nil {
-			slog.Warn("index sync", "err", err)
+		if ctx.Err() != nil {
+			return
 		}
+		wait := l.record(err)
+		timer.Reset(wait)
 		if changed {
 			l.Changed()
 		}
 	}
 }
 
-func (l *Loop) record(err error) {
+// record notes how a sync ended and returns the wait before the next. The
+// first failure of a streak is logged as a warning, the rest at debug
+// level, and the end of a streak at info.
+func (l *Loop) record(err error) time.Duration {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.last, l.lastErr = time.Now(), err
+	wait := l.Interval
+	switch {
+	case err != nil:
+		l.failures++
+		wait = min(l.Interval<<min(l.failures, 16), maxBackoff)
+		if l.failures == 1 {
+			slog.Warn("index sync failed; serving the index as it is and backing off", "err", err, "retry_in", wait)
+		} else {
+			slog.Debug("index sync failed", "failures", l.failures, "err", err, "retry_in", wait)
+		}
+	case l.failures > 0:
+		slog.Info("index sync works again", "failures", l.failures)
+		l.failures = 0
+	}
+	l.next = l.last.Add(wait)
+	return wait
 }
 
-// Status returns when the last sync ran and how it ended.
-func (l *Loop) Status() (time.Time, error) {
+// LoopStatus is how the last sync ended: when, with which error, how many
+// failed in a row, and when the next runs.
+type LoopStatus struct {
+	Last     time.Time
+	Err      error
+	Failures int
+	Next     time.Time
+}
+
+func (l *Loop) Status() LoopStatus {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.last, l.lastErr
+	return LoopStatus{Last: l.last, Err: l.lastErr, Failures: l.failures, Next: l.next}
 }
 
 // Refresh re-reads one file's info after the CDN answered 404 for it. Only

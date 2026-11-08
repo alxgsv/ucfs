@@ -27,15 +27,21 @@ func uuid(i int) string { return fmt.Sprintf("00000000-0000-4000-8000-%012d", i)
 
 func mount(t *testing.T, env *vfstest.Env) string {
 	t.Helper()
+	// UCFS_MOUNT_TESTS=1, as CI sets, makes a host that cannot mount fail
+	// the test rather than skip it.
+	cannot := t.Skipf
+	if os.Getenv("UCFS_MOUNT_TESTS") == "1" {
+		cannot = t.Fatalf
+	}
 	if f, err := os.OpenFile("/dev/fuse", os.O_RDWR, 0); err != nil {
-		t.Skipf("no usable /dev/fuse: %v", err)
+		cannot("no usable /dev/fuse: %v", err)
 	} else {
 		_ = f.Close()
 	}
 	dir := t.TempDir()
 	srv, err := Mount(dir, env.FS, false)
 	if err != nil {
-		t.Skipf("cannot mount FUSE here: %v", err)
+		cannot("cannot mount FUSE here: %v", err)
 	}
 	t.Cleanup(func() {
 		if err := srv.Unmount(); err != nil {

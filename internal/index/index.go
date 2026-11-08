@@ -63,6 +63,8 @@ ALTER TABLE shadow ADD COLUMN dir INTEGER NOT NULL DEFAULT 0;
 CREATE UNIQUE INDEX shadow_ino ON shadow (ino);
 `, `
 ALTER TABLE spools ADD COLUMN queued TEXT NOT NULL DEFAULT '';
+`, `
+CREATE TABLE node_salts (key TEXT PRIMARY KEY, salt INTEGER NOT NULL);
 `}
 
 const (
@@ -89,6 +91,15 @@ func Open(path string) (*Index, error) {
 	if err := ix.migrate(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate %s: %w", path, err)
+	}
+	// SQLite creates the files under the umask, new -wal and -shm files
+	// taking the database file's mode. The index lists every file name and
+	// its metadata.
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Chmod(p, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
+			_ = db.Close()
+			return nil, err
+		}
 	}
 	if err := ix.backfillKeys(); err != nil {
 		_ = db.Close()
@@ -228,11 +239,15 @@ func (ix *Index) upsert(ctx context.Context, files []api.File, advance bool, at 
 			treePath = p
 		}
 		dir, key := treeKeys(f.Metadata[TreePathKey])
-		if _, err := stmt.ExecContext(ctx, f.UUID, f.Name, f.Size, f.MIME, f.IsImage, f.IsReady,
+		name := f.Name
+		if n := f.Metadata[NameMetaKey]; n != "" {
+			name = n
+		}
+		if _, err := stmt.ExecContext(ctx, f.UUID, name, f.Size, f.MIME, f.IsImage, f.IsReady,
 			!f.StoredAt.IsZero(), !f.RemovedAt.IsZero(),
 			f.UploadedAt.Unix(), unixOrNil(f.StoredAt), unixOrNil(f.RemovedAt),
 			f.Width, f.Height, string(meta), string(tags), treePath, now,
-			dir, key, NameKey(f.Name)); err != nil {
+			dir, key, NameKey(name)); err != nil {
 			return err
 		}
 		if f.UploadedAt.After(cursor) {
@@ -267,6 +282,17 @@ func (ix *Index) advanceCursor(ctx context.Context, tx *sql.Tx, t time.Time) err
 		ON CONFLICT (key) DO UPDATE SET value = max(value, excluded.value)`,
 		keyListCursor, t.UTC().Format(time.RFC3339))
 	return err
+}
+
+// Synced reports whether a full listing went through once, so the index
+// holds the project, even an empty one.
+func (ix *Index) Synced(ctx context.Context) (bool, error) {
+	var v string
+	err := ix.db.QueryRowContext(ctx, `SELECT value FROM sync_state WHERE key = ?`, keyLastFullScan).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // Cursor is the newest upload time seen, zero before the first sync.

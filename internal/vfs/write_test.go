@@ -27,7 +27,7 @@ func writable(t *testing.T, w *vfs.Writes, files ...fake.File) *vfstest.Env {
 	return env
 }
 
-func walk(t *testing.T, env *vfstest.Env, p string) vfs.Entry {
+func walk(t testing.TB, env *vfstest.Env, p string) vfs.Entry {
 	t.Helper()
 	e, err := env.FS.Walk(context.Background(), p)
 	if err != nil {
@@ -384,10 +384,6 @@ func TestWriteProtection(t *testing.T) {
 		}},
 		{"create in tree/_inbox", syscall.EPERM, func() error { _, err := env.FS.Create(ctx, inbox.Node, "x.jpg"); return err }},
 		{"create at the root", syscall.EPERM, func() error { _, err := env.FS.Create(ctx, root.Node, "x.jpg"); return err }},
-		{"backslash in a name", syscall.EINVAL, func() error {
-			_, err := env.FS.Create(ctx, walk(t, env, "tree").Node, `a\b.txt`)
-			return err
-		}},
 	}
 	for _, tt := range tests {
 		if err := tt.op(); !errors.Is(err, tt.err) {
@@ -488,7 +484,7 @@ func TestHandlesOfObjects(t *testing.T) {
 		t.Fatal(err)
 	}
 	check := func(when string) {
-		n, err := env.FS.NodeByID(ctx, e.Node.Kind, e.Node.UUID, e.Node.ID())
+		n, err := env.FS.NodeByID(ctx, e.Node.Kind, e.Node.UUID, env.FS.ID(e.Node))
 		if err != nil || n != e.Node {
 			t.Errorf("%s: node by id = %+v, %v; want %+v", when, n, err, e.Node)
 		}
@@ -501,7 +497,39 @@ func TestHandlesOfObjects(t *testing.T) {
 	if err := env.FS.Remove(ctx, d.Node, "h.txt"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := env.FS.NodeByID(ctx, e.Node.Kind, e.Node.UUID, e.Node.ID()); err == nil {
+	if _, err := env.FS.NodeByID(ctx, e.Node.Kind, e.Node.UUID, env.FS.ID(e.Node)); err == nil {
 		t.Error("node of a removed file still resolves")
+	}
+}
+
+// A base upload drops a name up to its last backslash, so such a name goes
+// up with underscores and whole in ucfs:name, which every view shows.
+func TestBackslashNameUploadsWithUcfsName(t *testing.T) {
+	env := writable(t, nil)
+	put(t, env, "tree", `a\b.txt`, []byte("x"))
+	put(t, env, "files", `c\d.txt`, []byte("y"))
+	if got := list(t, env, "tree"); !slices.Contains(got, `a\b.txt`) {
+		t.Fatalf("tree/ = %q", got)
+	}
+	for _, f := range env.Fake.Files() {
+		want := map[string]string{"a_b.txt": `a\b.txt`, "c_d.txt": `c\d.txt`}[f.Name]
+		if want == "" || f.Metadata["ucfs:name"] != want {
+			t.Errorf("uploaded %q with ucfs:name %q", f.Name, f.Metadata["ucfs:name"])
+		}
+		if got := list(t, env, "files"); !slices.Contains(got, f.UUID+"_"+want) {
+			t.Errorf("files/ = %q, want %s_%s", got, f.UUID, want)
+		}
+	}
+	// Renamed to a plain name and overwritten, the file loses ucfs:name.
+	ctx := context.Background()
+	tree := walk(t, env, "tree").Node
+	if err := env.FS.Rename(ctx, tree, `a\b.txt`, tree, "plain.txt"); err != nil {
+		t.Fatal(err)
+	}
+	put(t, env, "tree", "plain.txt", []byte("z"))
+	for _, f := range env.Fake.Files() {
+		if f.Name == "plain.txt" && f.Metadata["ucfs:name"] != "" {
+			t.Errorf("overwrite of plain.txt kept ucfs:name %q", f.Metadata["ucfs:name"])
+		}
 	}
 }

@@ -154,6 +154,19 @@ func TestGroupSync(t *testing.T) {
 	if n, err := ix.SyncGroups(ctx, client); err != nil || n != 1 {
 		t.Fatalf("third sync = %d, %v", n, err)
 	}
+	// A group deleted elsewhere goes with the next sync; the API lists no
+	// deleted groups.
+	gone := srv.AddGroup(t0.Add(2*time.Hour), fs[2].UUID)
+	if n, err := ix.SyncGroups(ctx, client); err != nil || n != 1 {
+		t.Fatalf("fourth sync = %d, %v", n, err)
+	}
+	srv.DeleteGroup(gone)
+	if n, err := ix.SyncGroups(ctx, client); err != nil || n != 1 {
+		t.Fatalf("sync after a deletion = %d, %v", n, err)
+	}
+	if _, err := ix.Group(ctx, gone); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted group still indexed: %v", err)
+	}
 	groups, err := ix.Groups(ctx)
 	if err != nil || len(groups) != 6 {
 		t.Fatalf("groups = %d, %v", len(groups), err)

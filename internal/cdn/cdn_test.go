@@ -30,7 +30,7 @@ func TestOutputExt(t *testing.T) {
 }
 
 func TestURLEscapesArguments(t *testing.T) {
-	c := New("https://cdn.example/", nil)
+	c := New("https://cdn.example/", nil, nil)
 	for ops, want := range map[string]string{
 		"":                       "https://cdn.example/u/",
 		"-/resize/1200x/":        "https://cdn.example/u/-/resize/1200x/",
@@ -78,7 +78,7 @@ func TestBadRequestOnHeadFetchesTheMessage(t *testing.T) {
 		_, _ = w.Write([]byte(page))
 	}))
 	defer srv.Close()
-	c := New(srv.URL, nil)
+	c := New(srv.URL, nil, nil)
 	_, err := c.Head(context.Background(), "u", "-/resize/abc/")
 	var bad *BadRequestError
 	if !errors.As(err, &bad) {
@@ -90,7 +90,7 @@ func TestBadRequestOnHeadFetchesTheMessage(t *testing.T) {
 	if st := c.Stats(); st.Heads != 1 || st.Gets != 1 || st.Bytes != int64(len(page)) || len(methods) != 2 {
 		t.Errorf("stats = %+v, methods %v; want one HEAD and one GET for the message", st, methods)
 	}
-	if _, err := c.ReadRange(context.Background(), "u", "-/resize/abc/", make([]byte, 10), 0); !errors.As(err, &bad) {
+	if _, _, err := c.ReadRange(context.Background(), "u", "-/resize/abc/", make([]byte, 10), 0); !errors.As(err, &bad) {
 		t.Errorf("ranged GET: err = %v, want a BadRequestError", err)
 	}
 }

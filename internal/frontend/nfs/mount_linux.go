@@ -18,7 +18,7 @@ func mountArgs(port int, dir string, o MountOptions) []string {
 	opts := []string{
 		fmt.Sprintf("port=%d", port), fmt.Sprintf("mountport=%d", port),
 		"nfsvers=3", "proto=tcp", "mountproto=tcp", "nolock", "soft",
-		"rsize=1048576", "wsize=1048576", "acregmax=3600", "acdirmax=5",
+		"rsize=1048576", "wsize=1048576", "acregmax=3600", "acdirmax=5", "nosuid", "nodev",
 	}
 	if o.ReadOnly {
 		opts = append(opts, "ro")

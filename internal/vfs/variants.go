@@ -8,6 +8,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/alxgsv/ucfs/internal/api"
 	"github.com/alxgsv/ucfs/internal/cache"
 	"github.com/alxgsv/ucfs/internal/cdn"
 	"github.com/alxgsv/ucfs/internal/index"
@@ -129,14 +130,18 @@ func (f *FS) variant(ctx context.Context, uuid, ops string) (index.Variant, erro
 	case found && f.now().Sub(v.CheckedAt) < variantTTL:
 		return v, nil
 	case err != nil && !errors.Is(err, index.ErrNotFound):
-		slog.Error("variant lookup", "uuid", uuid, "ops", ops, "err", err)
-		return v, syscall.EIO
+		return v, f.ioErr("variant lookup "+uuid+"/"+ops, err)
 	}
 	key := uuid + "/" + ops
 	if err := f.recentFailure(key); err != nil {
 		return v, err
 	}
 	res, err, _ := f.heads.Do(key, func() (any, error) {
+		// A lookup that found no fresh answer just before another one's HEAD
+		// ended would otherwise send a second HEAD.
+		if cur, err := f.ix.Variant(ctx, uuid, ops); err == nil && f.now().Sub(cur.CheckedAt) < variantTTL {
+			return cur, nil
+		}
 		hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), headTimeout)
 		defer cancel()
 		return f.head(hctx, v, found)
@@ -163,7 +168,7 @@ func (f *FS) head(ctx context.Context, old index.Variant, found bool) (index.Var
 		return old, f.fail(key, syscall.ENOENT, missingTTL)
 	case err != nil:
 		slog.Warn("variant HEAD", "uuid", old.UUID, "ops", old.Ops, "err", err)
-		return old, syscall.EIO
+		return old, api.Errno(err)
 	}
 	now := f.now()
 	v := index.Variant{UUID: old.UUID, Ops: old.Ops, Size: info.Size, MIME: info.MIME, ETag: info.ETag,
@@ -179,6 +184,14 @@ func (f *FS) head(ctx context.Context, old index.Variant, found bool) (index.Var
 		slog.Warn("store variant", "uuid", v.UUID, "ops", v.Ops, "err", err)
 	}
 	return v, nil
+}
+
+// staleVariant makes the next access to a variant send a new HEAD, after a
+// range came with another ETag than the HEAD's.
+func (f *FS) staleVariant(ctx context.Context, uuid, ops string) {
+	if err := f.ix.ExpireVariant(ctx, uuid, ops); err != nil {
+		slog.Warn("expire variant", "uuid", uuid, "ops", ops, "err", err)
+	}
 }
 
 func (f *FS) fail(key string, errno syscall.Errno, ttl time.Duration) error {
@@ -212,7 +225,7 @@ func (f *FS) Remember(ctx context.Context, n Node) {
 	if !n.Kind.ByPath() || n.Ops == "" || n.Ino != 0 {
 		return
 	}
-	id := n.ID()
+	id := f.ID(n)
 	f.mu.Lock()
 	_, known := f.nodeOps[id]
 	if !known {
@@ -268,12 +281,12 @@ func (f *FS) NodeByID(ctx context.Context, kind Kind, uuid string, id uint64) (N
 		if ok, err := f.dirExists(ctx, n); err != nil || !ok {
 			return Node{}, syscall.ESTALE
 		}
-		if n.ID() != id {
+		if f.ID(n) != id {
 			n.Ino = id
 		}
 		return n, nil
 	}
-	if n.ID() != id {
+	if f.ID(n) != id {
 		return Node{}, syscall.ESTALE
 	}
 	return n, nil

@@ -160,7 +160,10 @@ func TestTwoReadersDoNotStall(t *testing.T) {
 	slow := file(1, "slow.bin", 8*cache.BlockSize)
 	quick := file(2, "fast.bin", cache.BlockSize)
 	env := vfstest.New(t, slow, quick)
-	env.Fake.SetLatency(slow.UUID, 300*time.Millisecond)
+	// Waiting behind the slow file would cost at least one of its requests;
+	// the bound sits well below that and well above a busy machine's read.
+	const slowLatency = time.Second
+	env.Fake.SetLatency(slow.UUID, slowLatency)
 
 	done := make(chan struct{})
 	go func() {
@@ -173,7 +176,7 @@ func TestTwoReadersDoNotStall(t *testing.T) {
 	if _, err := env.FS.Walk(context.Background(), "files"); err != nil {
 		t.Fatal(err)
 	}
-	if d := time.Since(start); d > 150*time.Millisecond {
+	if d := time.Since(start); d > slowLatency/2 {
 		t.Errorf("second reader took %v while the first waited on the CDN", d)
 	}
 	<-done

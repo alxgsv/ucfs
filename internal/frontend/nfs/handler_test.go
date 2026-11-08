@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -28,18 +30,31 @@ func uuid(i int) string { return fmt.Sprintf("00000000-0000-4000-8000-%012d", i)
 
 func mount(t *testing.T, env *vfstest.Env) *nfsc.Target {
 	t.Helper()
+	return mountAs(t, env, uint32(os.Getuid()))
+}
+
+// mountAs talks to a server over RPC with AUTH_UNIX credentials of uid, as
+// the kernel client does for a local user.
+func mountAs(t *testing.T, env *vfstest.Env, uid uint32) *nfsc.Target {
+	t.Helper()
 	srv, err := Serve(env.FS)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = srv.Close() })
-	c, err := rpc.DialTCP("tcp", fmt.Sprintf("127.0.0.1:%d", srv.Port()), false)
+	// The client binds a random local port, which may be in use.
+	var c *rpc.Client
+	for range 5 {
+		if c, err = rpc.DialTCP("tcp", fmt.Sprintf("127.0.0.1:%d", srv.Port()), false); !errors.Is(err, syscall.EADDRINUSE) {
+			break
+		}
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(c.Close)
 	m := nfsc.Mount{Client: c}
-	target, err := m.Mount("/", rpc.AuthNull)
+	target, err := m.Mount("/", rpc.NewAuthUnix("ucfs-test", uid, uint32(os.Getgid())).Auth())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,6 +142,22 @@ func TestServeOverRPC(t *testing.T) {
 	wg.Wait()
 }
 
+// ACCESS grants nothing to another user of the machine, so the kernel
+// client keeps them out; the daemon's user and root get what they ask.
+func TestAccessOnlyForOwner(t *testing.T) {
+	files := []fake.File{{UUID: uuid(1), Name: "a.jpg", Size: 3, Uploaded: t0}}
+	p := "/files/" + uuid(1) + "_a.jpg"
+	for _, tc := range []struct {
+		uid  uint32
+		want uint32
+	}{{uint32(os.Getuid()), 0x23}, {0, 0x23}, {uint32(os.Getuid()) + 1, 0}} {
+		target := mountAs(t, vfstest.New(t, files...), tc.uid)
+		if got, err := target.Access(p, 0x3f); err != nil || got != tc.want {
+			t.Errorf("uid %d: access = %#x, %v; want %#x", tc.uid, got, err, tc.want)
+		}
+	}
+}
+
 func TestHandleRoundTrip(t *testing.T) {
 	env := vfstest.New(t, fake.File{UUID: uuid(42), Name: "hero.jpg", Size: 10, Uploaded: t0, Tags: []string{"x"}})
 	group := env.Fake.AddGroup(t0, uuid(42))
@@ -177,7 +208,7 @@ func TestHandleRoundTrip(t *testing.T) {
 			}
 		}
 	}
-	unknown := encodeHandle(vfs.Node{Kind: vfs.KindVariantDir, UUID: uuid(42), Ops: "-/never/handed/out/"})
+	unknown := encodeHandle(env.FS, vfs.Node{Kind: vfs.KindVariantDir, UUID: uuid(42), Ops: "-/never/handed/out/"})
 	if _, err := h.decodeHandle(ctx, unknown); err == nil {
 		t.Error("handle of a node never handed out resolved")
 	}
@@ -371,7 +402,7 @@ func TestDirectoryHandleSurvivesRename(t *testing.T) {
 			t.Errorf("old handle resolves to %q, %v; want %s", p, err, want)
 		}
 		n, err := h.decodeHandle(ctx, []byte(b))
-		if err != nil || binary.BigEndian.Uint64([]byte(b)[20:]) != n.ID() {
+		if err != nil || binary.BigEndian.Uint64([]byte(b)[20:]) != env.FS.ID(n) {
 			t.Errorf("old handle's node %+v keeps id? %v", n, err)
 		}
 	}
@@ -457,6 +488,8 @@ func TestByDateOverRPC(t *testing.T) {
 				names = append(names, e.FileName)
 			}
 		}
+		// The client keeps entries in a map; the server sends them sorted.
+		slices.Sort(names)
 		dirs = append(dirs, strings.Join(names, ","))
 	}
 	if want := []string{"2026", "03", "04,05"}; strings.Join(dirs, " ") != strings.Join(want, " ") {

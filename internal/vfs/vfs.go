@@ -7,7 +7,6 @@ package vfs
 import (
 	"context"
 	"errors"
-	"hash/fnv"
 	"io"
 	"log/slog"
 	"os"
@@ -20,6 +19,7 @@ import (
 
 	"golang.org/x/sync/singleflight"
 
+	"github.com/alxgsv/ucfs/internal/api"
 	"github.com/alxgsv/ucfs/internal/cache"
 	"github.com/alxgsv/ucfs/internal/cdn"
 	"github.com/alxgsv/ucfs/internal/index"
@@ -105,50 +105,51 @@ type Node struct {
 	Ino uint64
 }
 
-// ID is the node's stable 64-bit identity, used as inode and NFS file id.
-func (n Node) ID() uint64 {
-	h := fnv.New64a()
+// idKey is what a node's id is a hash of, or "" for a node whose id is an
+// object's inode number (tree and shadow files, and a tree or shadow
+// directory rebuilt from a handle handed out before it was renamed).
+func (n Node) idKey() string {
 	switch n.Kind {
 	case KindRoot:
-		_, _ = h.Write([]byte("root"))
+		return "root"
 	case KindFilesDir:
-		_, _ = h.Write([]byte("files"))
+		return "files"
 	case KindFile:
-		_, _ = h.Write([]byte("files\x00" + n.UUID + "\x00"))
+		return "files\x00" + n.UUID + "\x00"
 	case KindFileDir:
-		_, _ = h.Write([]byte("files\x00" + n.UUID + "\x00/"))
+		return "files\x00" + n.UUID + "\x00/"
 	case KindVariantDir:
-		_, _ = h.Write([]byte("files\x00" + n.UUID + "\x00" + n.Ops))
+		return "files\x00" + n.UUID + "\x00" + n.Ops
 	case KindVariant:
-		_, _ = h.Write([]byte("files\x00" + n.UUID + "\x00" + n.Ops + "\x00"))
+		return "files\x00" + n.UUID + "\x00" + n.Ops + "\x00"
 	case KindTreeFile, KindShadow:
-		return n.Ino
+		return ""
 	case KindTreeDir:
 		if n.Ino != 0 {
-			return n.Ino
+			return ""
 		}
-		_, _ = h.Write([]byte("tree\x00" + n.Ops))
+		return "tree\x00" + n.Ops
 	case KindInbox:
-		_, _ = h.Write([]byte("tree\x00" + InboxDir))
+		return "tree\x00" + InboxDir
 	case KindShadowDir:
 		if n.Ino != 0 {
-			return n.Ino
+			return ""
 		}
-		_, _ = h.Write([]byte("shadow\x00" + n.Ops))
+		return "shadow\x00" + n.Ops
 	case KindUcfsDir:
-		_, _ = h.Write([]byte(UcfsDir))
+		return UcfsDir
 	case KindJournal:
-		_, _ = h.Write([]byte(UcfsDir + "/" + JournalName))
+		return UcfsDir + "/" + JournalName
 	case KindNeverIndex:
-		_, _ = h.Write([]byte(NeverIndex))
+		return NeverIndex
 	case KindViewDir:
-		_, _ = h.Write([]byte("view\x00" + n.Ops))
+		return "view\x00" + n.Ops
 	case KindDateFile:
-		_, _ = h.Write([]byte(ViewByDate + "\x00" + n.UUID))
+		return ViewByDate + "\x00" + n.UUID
 	case KindViewFile:
-		_, _ = h.Write([]byte("view\x00" + n.Ops + "\x00" + n.UUID))
+		return "view\x00" + n.Ops + "\x00" + n.UUID
 	}
-	return h.Sum64()
+	return ""
 }
 
 func (n Node) IsDir() bool {
@@ -212,6 +213,7 @@ type FS struct {
 	failed map[string]failure
 	// nodeOps holds the operations paths of node ids already in the index.
 	nodeOps map[uint64]string
+	ids     idTable
 
 	views map[string]bool
 	opts  Options
@@ -226,6 +228,7 @@ type FS struct {
 func New(ix *index.Index, c *cache.Cache, head Header, missing func(uuid string)) *FS {
 	f := &FS{ix: ix, cache: c, cdn: head, now: time.Now, missing: missing,
 		failed: map[string]failure{}, nodeOps: map[uint64]string{}}
+	f.ids.load(ix)
 	f.Configure(Options{})
 	f.Touch()
 	return f
@@ -323,7 +326,15 @@ func (f *FS) Getattr(ctx context.Context, n Node) (Attr, error) {
 	return Attr{}, syscall.ENOENT
 }
 
+// ioErr is the errno of an index failure. A query the caller's context
+// cancelled is EINTR, which callers retry: FUSE cancels a request's context
+// when a signal interrupts the process waiting on it, and the Go runtime
+// sends its threads signals all the time.
 func (f *FS) ioErr(what string, err error) error {
+	if errors.Is(err, context.Canceled) {
+		slog.Debug(what, "err", err)
+		return syscall.EINTR
+	}
 	slog.Error(what, "err", err)
 	return syscall.EIO
 }
@@ -335,8 +346,7 @@ func (f *FS) file(ctx context.Context, uuid string) (index.File, error) {
 	case errors.Is(err, index.ErrNotFound) || (err == nil && file.Removed):
 		return file, syscall.ENOENT
 	case err != nil:
-		slog.Error("index lookup", "uuid", uuid, "err", err)
-		return file, syscall.EIO
+		return file, f.ioErr("index lookup "+uuid, err)
 	}
 	return file, nil
 }
@@ -410,8 +420,7 @@ func (f *FS) ReadDir(ctx context.Context, dir Node) ([]Entry, error) {
 	case KindFilesDir:
 		files, err := f.ix.Files(ctx)
 		if err != nil {
-			slog.Error("index listing", "err", err)
-			return nil, syscall.EIO
+			return nil, f.ioErr("index listing", err)
 		}
 		out := make([]Entry, len(files))
 		for i, file := range files {
@@ -450,6 +459,10 @@ func (f *FS) ReadDir(ctx context.Context, dir Node) ([]Entry, error) {
 // which decides from the API whether the file is really gone; a CDN 400
 // means the operations do not apply to the file.
 func (f *FS) ReadAt(ctx context.Context, n Node, p []byte, off int64) (int, error) {
+	// A read finishes even when its caller is interrupted: Linux reports
+	// any failed buffered FUSE read as EIO, EINTR included, and the bytes
+	// are fetched on a context of their own anyway.
+	ctx = context.WithoutCancel(ctx)
 	switch {
 	case n.IsDir():
 		return 0, syscall.EISDIR
@@ -480,21 +493,41 @@ func (f *FS) readFile(ctx context.Context, n Node, file index.File, p []byte, of
 		k, size = cache.Key{UUID: n.UUID, Ops: n.Ops, Version: v.ETag}, v.Size
 	}
 	got, err := f.cache.ReadAt(ctx, k, size, p, off)
-	var bad *cdn.BadRequestError
-	switch {
-	case err == nil || errors.Is(err, io.EOF):
+	if err == nil || errors.Is(err, io.EOF) {
 		return got, err
+	}
+	var bad *cdn.BadRequestError
+	var changed *cache.ChangedError
+	switch {
 	case errors.Is(err, cdn.ErrNotFound):
 		f.cache.Forget(k)
 		f.notFound(n.UUID)
-		return got, syscall.ENOENT
 	case errors.As(err, &bad):
 		slog.Info("CDN rejected a variant", "uuid", n.UUID, "ops", n.Ops, "message", bad.Message)
-		return got, syscall.EINVAL
+	case errors.As(err, &changed):
+		slog.Warn("content changed while being read; its cached blocks are dropped and the read fails",
+			"uuid", n.UUID, "ops", n.Ops, "etag", changed.Got, "was", changed.Want)
+		if n.Kind == KindVariant {
+			f.staleVariant(ctx, n.UUID, n.Ops)
+		}
+	case errors.Is(err, cache.ErrBudget):
 	default:
 		slog.Error("read", "uuid", n.UUID, "ops", n.Ops, "off", off, "err", err)
-		return got, syscall.EIO
 	}
+	return got, api.Errno(err)
+}
+
+// PastBudget reports whether reading a file in full could take more CDN
+// bytes than the traffic budget has left today. The Linux kernel's buffered
+// read path reports any failed read as EIO, so the FUSE front-end opens
+// such a file with direct I/O, where the reader gets EDQUOT.
+func (f *FS) PastBudget(ctx context.Context, n Node) bool {
+	room, ok := f.cache.Room()
+	if !ok {
+		return false
+	}
+	a, err := f.Getattr(ctx, n)
+	return err == nil && a.Size > room
 }
 
 func (f *FS) notFound(uuid string) {

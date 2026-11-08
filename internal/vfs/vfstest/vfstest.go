@@ -50,7 +50,7 @@ func New(t testing.TB, files ...fake.File) *Env {
 	if _, err := ix.Sync(context.Background(), client, false); err != nil {
 		t.Fatal(err)
 	}
-	cd := cdn.New(srv.CDNBase(), nil)
+	cd := cdn.New(srv.CDNBase(), nil, nil)
 	c, err := cache.Open(cd, cache.Options{Dir: filepath.Join(dir, "blocks"), MaxBytes: 1 << 30})
 	if err != nil {
 		t.Fatal(err)

@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Everything runs against internal/fake: no job needs the project's keys.
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: golangci-lint for linux
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.11.3
+      - name: golangci-lint for darwin
+        run: GOOS=darwin golangci-lint run ./...
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Install FUSE
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fuse3
+          ls -l /dev/fuse "$(command -v fusermount3)"
+      - name: Build for linux and darwin
+        run: make build cross
+      # UCFS_MOUNT_TESTS=1 mounts FUSE for real and fails, rather than
+      # skips, the tests that cannot mount.
+      - name: Test with the race detector
+        env:
+          UCFS_MOUNT_TESTS: "1"
+        run: make race
+
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      # The latest earlier run's output, from this branch or main.
+      - uses: actions/cache/restore@v4
+        with:
+          path: bench-previous.txt
+          key: bench-${{ github.sha }}
+          restore-keys: bench-
+      - name: Benchmarks against the fake
+        run: make bench
+      - name: Summary
+        run: |
+          {
+            echo "## Benchmarks"
+            echo
+            echo "Against internal/fake with 20 ms of CDN latency; medians of three runs. Raw output: the bench artifact."
+            echo
+            if [ -f bench-previous.txt ]; then
+              go run ./spikes/benchtable -old bench-previous.txt < bin/bench.txt
+            else
+              go run ./spikes/benchtable < bin/bench.txt
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          cp bin/bench.txt bench-previous.txt
+      - uses: actions/cache/save@v4
+        with:
+          path: bench-previous.txt
+          key: bench-${{ github.sha }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench
+          path: bin/bench.txt

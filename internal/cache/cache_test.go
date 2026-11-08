@@ -12,29 +12,56 @@ import (
 )
 
 type fakeFetcher struct {
+	mu      sync.Mutex
 	data    map[string][]byte
+	etags   map[string]string
 	delay   time.Duration
 	calls   atomic.Int64
 	fetched atomic.Int64
 	fail    error
+	// inflight and peak count fetches in progress and the most at once.
+	inflight, peak atomic.Int64
 }
 
-func (f *fakeFetcher) ReadRange(ctx context.Context, uuid, _ string, p []byte, off int64) (int, error) {
+func (f *fakeFetcher) ReadRange(ctx context.Context, uuid, _ string, p []byte, off int64) (int, string, error) {
 	f.calls.Add(1)
 	if f.fail != nil {
-		return 0, f.fail
+		return 0, "", f.fail
+	}
+	cur := f.inflight.Add(1)
+	defer f.inflight.Add(-1)
+	for {
+		top := f.peak.Load()
+		if cur <= top || f.peak.CompareAndSwap(top, cur) {
+			break
+		}
 	}
 	select {
 	case <-time.After(f.delay):
 	case <-ctx.Done():
-		return 0, ctx.Err()
+		return 0, "", ctx.Err()
 	}
-	n := copy(p, f.data[uuid][off:])
+	f.mu.Lock()
+	data, etag := f.data[uuid], f.etags[uuid]
+	f.mu.Unlock()
+	n := copy(p, data[off:])
 	f.fetched.Add(int64(n))
 	if n < len(p) {
-		return n, io.ErrUnexpectedEOF
+		return n, etag, io.ErrUnexpectedEOF
 	}
-	return n, nil
+	return n, etag, nil
+}
+
+// set replaces an object's content and ETag, as the CDN serving a new
+// rendering would.
+func (f *fakeFetcher) set(uuid string, data []byte, etag string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.data[uuid] = data
+	if f.etags == nil {
+		f.etags = map[string]string{}
+	}
+	f.etags[uuid] = etag
 }
 
 func pattern(n int, seed byte) []byte {
@@ -105,7 +132,6 @@ func TestSequentialReadPrefetchesAndFetchesOnce(t *testing.T) {
 	k := Key{UUID: "a"}
 	buf := make([]byte, BlockSize)
 	var got []byte
-	start := time.Now()
 	for off := int64(0); off < int64(size); off += BlockSize {
 		n, err := c.ReadAt(context.Background(), k, int64(size), buf, off)
 		if err != nil && !errors.Is(err, io.EOF) {
@@ -113,7 +139,6 @@ func TestSequentialReadPrefetchesAndFetchesOnce(t *testing.T) {
 		}
 		got = append(got, buf[:n]...)
 	}
-	elapsed := time.Since(start)
 	waitIdle(t, c)
 	if !bytes.Equal(got, f.data["a"]) {
 		t.Fatal("content mismatch")
@@ -125,9 +150,10 @@ func TestSequentialReadPrefetchesAndFetchesOnce(t *testing.T) {
 	if st.FetchedPrefetch == 0 || st.Hit == 0 {
 		t.Errorf("no prefetch happened: %+v", st)
 	}
-	// 16 sequential 20 ms fetches take 320 ms; prefetch must overlap them.
-	if elapsed > 200*time.Millisecond {
-		t.Errorf("sequential read took %v, prefetch is not concurrent", elapsed)
+	// Prefetch must overlap fetches; how much time that saves depends on
+	// the machine, so the overlap itself is what is checked.
+	if p := f.peak.Load(); p < 2 {
+		t.Errorf("at most %d fetch in flight at once, prefetch is not concurrent", p)
 	}
 }
 
