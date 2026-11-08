@@ -24,7 +24,7 @@ Decisions fixed up front:
 |---|---|---|
 | Language, toolchain | Go 1.26, `CGO_ENABLED=0` | Matches `uploadcare-go` and `uploadcare-cli`; static binaries; cross-compile for darwin/linux from one machine |
 | Repository and module path | `github.com/alxgsv/ucfs`, private for now, checkout `~/workspace/ucfs` | Personal repo while experimental; the module path equals the repo path, so going public needs no rename. A later move to the `uploadcare` org is a module-path change in `go.mod` and imports, nothing structural |
-| macOS front-end | Loopback NFSv3 server (`github.com/willscott/go-nfs`) mounted with the built-in `mount_nfs` | Zero install, no kext, works on managed Macs. Proven by rclone `nfsmount` |
+| macOS front-end | Loopback NFSv3 server (`github.com/willscott/go-nfs`, pinned to master `c092ae79c64e` for `Server.ConcurrentHandlers`, which v0.0.4 lacks) mounted with the built-in `mount_nfs` as the user, no `sudo` (Spike A) | Zero install, no kext, works on managed Macs. Proven by rclone `nfsmount` |
 | Linux front-end | FUSE via `github.com/hanwen/go-fuse/v2` (pure Go) | No libfuse dependency, full semantics (close, xattrs, invalidation). NFS front-end also builds on Linux as a fallback |
 | Index | SQLite via `modernc.org/sqlite` | Pure Go; WAL gives concurrent readers; survives restarts |
 | API client | `github.com/uploadcare/uploadcare-go/v2` (`file`, `upload`, `metadata`, `tag`, `group`, `project`) with `RetryConfig` enabled | Already covers list, search, info, store/delete, local copy, base and multipart upload, metadata, tags, groups |
@@ -69,18 +69,19 @@ Get a binary, a config, an index, and answers to the open questions that could c
 8. Spike E, scan cost: full scan of the largest internal test project available at 1000/page; record duration and any 429s.
 
 Result: `ucfs version`, `ucfs index sync`, and a short `docs/spikes.md` with the answers. Every later phase assumes them.
+The answers are in [docs/spikes.md](docs/spikes.md); the items below already reflect them.
 
 ### Phase 1: Read-only mount on macOS and Linux (≈ 4 days)
 
 One view end to end through both front-ends.
 
-9. `internal/vfs/`: node model (`NodeID` = 64-bit hash of view + uuid + ops/path), attrs from the index, `Lookup`, `ReadDir` with cursor, `Open`/`ReadAt`/`Release`, per-node attribute TTL hints (long for immutable entries, short for directories).
-10. `views/files`: `files/<uuid>_<original_filename>`; `files/<uuid>/` resolvable but not listed (reserved for Phase 2 variants).
+9. `internal/vfs/`: node model (`NodeID` = 64-bit hash of view + uuid + ops/path), attrs from the index, `Lookup`, `ReadDir` with cursor, `Open`/`ReadAt`/`Release`, per-node attribute TTL hints (long for immutable entries, short for directories). `Lookup` matches names under Unicode NFC: the server keeps NFC and NFD names distinct, and with the `nfc` mount option macOS sends NFC in LOOKUP even for a name it listed as NFD (Spike D).
+10. `views/files`: `files/<uuid>_<original_filename>`; `files/<uuid>/` resolvable but not listed (reserved for Phase 2 variants). Server names can contain `/` (multipart keeps it, Spike D), so the view maps `/`, and NUL defensively, to safe characters.
 11. `internal/cdn/`: CDN base from public key (same derivation as the CLI), `HEAD`, ranged `GET`, ETag capture.
-12. `internal/cache/`: 1 MiB blocks on disk, size-bounded LRU, singleflight per (uuid, ops, block), sequential detector with prefetch window 1 → 16 MiB, per-mount byte counters.
-13. `internal/frontend/nfs/`: `nfs.Handler` with stable, self-describing file handles (version, kind, uuid, ops/path hash) instead of the path-LRU helper; billy adapter over `vfs`; `ConcurrentHandlers` 128; mount/unmount driver using the Spike A option string.
+12. `internal/cache/`: 1 MiB blocks on disk, size-bounded LRU, singleflight per (uuid, ops, block), sequential detector with prefetch window 1 → 16 MiB, per-mount byte counters. NFS has no open handle (go-nfs re-opens the file for every READ), so the detector is keyed per file and tracks several streams, so two readers of one file do not reset each other's window. Prefetch fetches the blocks ahead concurrently: with `readahead=0` the client sends one READ at a time per reader (Spike A).
+13. `internal/frontend/nfs/`: `nfs.Handler` with stable, self-describing file handles (version, kind, uuid, ops/path hash) instead of the path-LRU helper; billy adapter over `vfs`; `ConcurrentHandlers` 128; mount/unmount driver using the Spike A option string (§4.6). go-nfs calls `Lstat` on almost every RPC and `Open`+`Stat` on every READ, so both must be index-only. `HandleLimit` must be large because READDIR caps a reply at `HandleLimit()/2` entries, and the handler implements go-nfs's verifier cache so a large directory is not re-listed for every READDIR page.
 14. `internal/frontend/fuse/` (linux): go-fuse node adapter; `MaxReadAhead` and `MaxWrite` 1 MiB; entry/attr timeouts from vfs hints.
-15. `ucfs mount <dir> --read-only` (default on in this phase), `ucfs umount <dir>`, `ucfs status` (counters over the control socket).
+15. `ucfs mount <dir> --read-only` (default on in this phase; on macOS it adds `rdonly`, which stops Finder's `.DS_Store` writes and SETATTRs, Spike C), `ucfs umount <dir>`, `ucfs status` (counters over the control socket).
 16. Index sync loop: incremental listing every 30 s from the stored cursor; `removed=true` sweep every 10 min; CDN 404 marks a file removed and refreshes its info.
 
 Acceptance: on this Mac without installing anything, `ls`, `cat`, `open` an image in Preview and `rsync` a subset out all
@@ -102,10 +103,14 @@ Acceptance: `cp files/<uuid>/-/resize/1200x/-/format/webp/hero.webp .` produces 
 
 ### Phase 3: Writes (≈ 5 days)
 
-21. `internal/spool/`: spool files under the cache dir; `Create`/`WriteAt`/`Truncate(0)`; commit = upload with
+21. `internal/spool/`: spool files under the cache dir; `Create`/`WriteAt`/`Truncate(0)`, and truncate to the current
+    length as a no-op (macOS `cp` issues one after every write, Spike C); commit = upload with
     `UPLOADCARE_STORE=1`, part filename = written name (`original_filename`), base upload ≤ 100 MB, multipart above.
+    Base upload keeps only what follows the last `\` in a name (Spike D), so names containing `\` fail with `EINVAL`
+    until the `ucfs:name` fallback exists.
 22. Commit triggers: FUSE `Flush` (blocking, error returned to the writer); NFS `COMMIT` or 3 s idle after the last
-    `WRITE`. Zero-length files stay local until written or removed (documented limitation).
+    `WRITE`. Zero-length files stay local until written or removed (documented limitation; the API itself accepts
+    empty files, Spike D).
 23. `views/tree`: `tree/<path>/<name>` from metadata key `ucfs:path`; `mkdir`/`rmdir` via `tree_dirs`; `rename` of an
     uploaded file = one metadata `PUT`; directory rename = N metadata updates with a warning above 1000 entries; files
     without `ucfs:path` appear under `tree/_inbox/`.
@@ -207,18 +212,23 @@ Create → spool → writes → commit trigger (FUSE `Flush`, NFS `COMMIT`/idle)
 journal → spool removal. Replacement of an existing name follows `--on-overwrite`. Upload failures return `EIO` on
 `Flush`; on NFS they are logged and the spool is kept for `ucfs spool retry`.
 
-### 4.6 Mount options (to be confirmed by Spike A)
+### 4.6 Mount options (confirmed by Spike A)
 
-macOS: `mount_nfs -o port=P,mountport=P,nfsvers=3,tcp,locallocks,rsize=1048576,wsize=1048576,nfc,soft,intr,
-acregmax=3600,acdirmax=5 localhost:/ <dir>`. Linux FUSE: `fsname=ucfs`, `noatime`, `max_read=1048576`, no `allow_other`.
+macOS, run as the user: `mount_nfs -o port=P,mountport=P,vers=3,tcp,locallocks,noresvport,rsize=1048576,
+wsize=1048576,readahead=0,nfc,soft,intr,acregmax=3600,acdirmax=5,nobrowse[,rdonly] 127.0.0.1:/ <dir>`. Without
+`rsize`/`wsize` the client negotiates 32 KiB. `readahead=0` is a traffic choice: at 1 MiB blocks the client's default
+read-ahead turns a 4 KiB read into 16 MiB of traffic. It also makes cold sequential speed depend entirely on daemon
+prefetch, so Phase 1 re-measures it against a read-ahead of 2–4. `127.0.0.1`, not `localhost`, which can
+resolve to `::1`. `nobrowse` keeps the mount out of the Finder sidebar; `rdonly` while read-only. Linux FUSE:
+`fsname=ucfs`, `noatime`, `max_read=1048576`, no `allow_other`.
 
 ## 5. Testing strategy
 
 - Unit tests for `vfs`, `cache`, `spool`, `index` against `internal/fake` (REST with cursor pagination, metadata,
   storage, search; Upload with base and multipart; CDN with deterministic bytes, `Range` and `HEAD` for originals and
   variants).
-- Front-end tests: Linux FUSE mounted in CI (ubuntu runner with `fuse3`); macOS NFS mounted on a macOS runner when
-  Spike A shows non-root mounting works, otherwise run locally and documented.
+- Front-end tests: Linux FUSE mounted in CI (ubuntu runner with `fuse3`); macOS NFS mounted on a macOS runner as
+  the user (Spike A showed non-root mounting works).
 - Live tests gated by `UCFS_LIVE=1` against `uploadcare-go-test`: upload, read back, metadata round trip, delete.
 - Golden files for `ucfs status --json` and `ucfs resolve --json`.
 - Benchmarks from Phase 5 run on every PR and compared against the previous run.
@@ -227,10 +237,10 @@ acregmax=3600,acdirmax=5 localhost:/ <dir>`. Linux FUSE: `fsname=ucfs`, `noatime
 
 | Risk | Phase that answers it | Fallback |
 |---|---|---|
-| Non-root NFS mount on macOS | 0 (Spike A) | one-time `sudo` setup documented |
-| Unpublished rate limits during full scans | 0 (Spike E) | adaptive page delay, resume from cursor |
-| `original_filename` mangling | 0 (Spike D) | store the written name in `ucfs:name` metadata and display it |
-| Finder/Spotlight traffic | 0 (Spike C), 3, 5 | shadow files, `.metadata_never_index`, traffic budget |
+| Non-root NFS mount on macOS | Retired in 0 (Spike A): works as the user | — |
+| Unpublished rate limits during full scans | Open after 0 (Spike E ran on a 33-file project; one request, no 429) | adaptive page delay, resume from cursor (implemented) |
+| `original_filename` mangling | Retired in 0 (Spike D) except names with `\` (base upload strips through the last `\` or `/`) | store the written name in `ucfs:name` metadata and display it; `EINVAL` until then |
+| Finder/Spotlight traffic | 0 (Spike C), 3, 5. Spotlight is off on NFS mounts by default; Finder icon view read every test image in full (JPEGs without an embedded thumbnail, also with `readahead=0`), and `.ql_disablethumbnails` does not stop it | `nobrowse`, `rdonly`, `readahead=0`, shadow files, traffic counter and budget |
 | NFS has no close event | 3 | idle commit; FUSE-T front-end in V1.1 for strict semantics |
 | No xattrs over NFSv3 on macOS | 4 | `ucfs resolve` and the CLI cover metadata on macOS until V1.1 |
 | go-nfs maturity ("minimally tested") | 1, 5 (soak) | fork and fix; rclone uses the same library in production |
