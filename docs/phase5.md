@@ -341,7 +341,8 @@ throughout, `-v` logging, `--traffic-budget 50MB`:
 What the curves say:
 
 - **Goroutines and descriptors do not grow** on any run: 23–45 goroutines and 31–43 descriptors on macOS, 36–58
-  goroutines (spikes to about 130 while many FUSE requests were in flight) and 32–39 descriptors on Linux, 18 and
+  goroutines at the half-hour marks (single samples up to 230 in the 3-hour run and 157 in the final hour, while many
+  FUSE requests were in flight) and 32–39 descriptors on Linux, 18 and
   21–25 live.
 - **The cache stays at its limit** (128 MiB) once full; the live one holds the uploads it was seeded with.
 - **The index grows with churn**, as designed: it keeps a row for every removed file, and about 9,000 files came and
@@ -391,9 +392,10 @@ The full 24 hours are `make soak` (or `make soak SOAK=6h`), which writes `bin/so
   for index queries the cancellation aborted: about 1,500 errors in 3 hours, with 76,000 `context canceled` lines in
   the log. Any Go program reading through a FUSE mount would hit it. A cancelled index query is now `EINTR`, which the
   caller retries, and reads no longer depend on the caller's context.
-- **Duplicate refreshes.** A reader that found a file's info stale just before another reader's refresh ended
-  started a second one; `TestLazyRefresh` failed 2 times in 40 under `-race` on Linux, the first time the suite ran
-  with cgo there. The shared refresh, md5 `HEAD` and group read now check again inside the shared call.
+- **Duplicate refreshes and HEADs.** A reader that found a file's info stale just before another reader's refresh
+  ended started a second one; `TestLazyRefresh` failed 2 times in 40 under `-race` on Linux, the first time the suite
+  ran with cgo there, and `TestVariantStatCostsOneHead` 2 times in 100 for the same reason with a variant's `HEAD`.
+  The shared refresh, md5 and variant `HEAD`s and group read now check again inside the shared call (0 in 100).
 - **An empty project's index has no cursor**, which the first version of the "index exists" check took for an unsynced
   index.
 - **Two flaky NFS tests**: the RPC test client binds a random local port that may be in use, and keeps directory

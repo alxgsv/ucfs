@@ -137,6 +137,11 @@ func (f *FS) variant(ctx context.Context, uuid, ops string) (index.Variant, erro
 		return v, err
 	}
 	res, err, _ := f.heads.Do(key, func() (any, error) {
+		// A lookup that found no fresh answer just before another one's HEAD
+		// ended would otherwise send a second HEAD.
+		if cur, err := f.ix.Variant(ctx, uuid, ops); err == nil && f.now().Sub(cur.CheckedAt) < variantTTL {
+			return cur, nil
+		}
 		hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), headTimeout)
 		defer cancel()
 		return f.head(hctx, v, found)
