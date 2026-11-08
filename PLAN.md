@@ -75,18 +75,20 @@ The answers are in [docs/spikes.md](docs/spikes.md); the items below already ref
 
 One view end to end through both front-ends.
 
-9. `internal/vfs/`: node model (`NodeID` = 64-bit hash of view + uuid + ops/path), attrs from the index, `Lookup`, `ReadDir` with cursor, `Open`/`ReadAt`/`Release`, per-node attribute TTL hints (long for immutable entries, short for directories). `Lookup` matches names under Unicode NFC: the server keeps NFC and NFD names distinct, and with the `nfc` mount option macOS sends NFC in LOOKUP even for a name it listed as NFD (Spike D).
+9. `internal/vfs/`: node model (`NodeID` = 64-bit hash of view + uuid + ops/path), attrs from the index, `Lookup`, `ReadDir` (a full listing from the index; the NFS adapter pages it with go-nfs's verifier cache, so no cursor is needed), `Open`/`ReadAt`/`Release`, per-node attribute TTL hints (long for immutable entries, short for directories). `Lookup` matches names under Unicode NFC: the server keeps NFC and NFD names distinct, and with the `nfc` mount option macOS sends NFC in LOOKUP even for a name it listed as NFD (Spike D).
 10. `views/files`: `files/<uuid>_<original_filename>`; `files/<uuid>/` resolvable but not listed (reserved for Phase 2 variants). Server names can contain `/` (multipart keeps it, Spike D), so the view maps `/`, and NUL defensively, to safe characters.
 11. `internal/cdn/`: CDN base from public key (same derivation as the CLI), `HEAD`, ranged `GET`, ETag capture.
-12. `internal/cache/`: 1 MiB blocks on disk, size-bounded LRU, singleflight per (uuid, ops, block), sequential detector with prefetch window 1 → 16 MiB, per-mount byte counters. NFS has no open handle (go-nfs re-opens the file for every READ), so the detector is keyed per file and tracks several streams, so two readers of one file do not reset each other's window. Prefetch fetches the blocks ahead concurrently: with `readahead=0` the client sends one READ at a time per reader (Spike A).
+12. `internal/cache/`: 1 MiB blocks on disk, size-bounded LRU, singleflight per (uuid, ops, block), sequential detector with prefetch window 1 → 16 MiB, per-mount byte counters. NFS has no open handle (go-nfs re-opens the file for every READ), so the detector is keyed per file and tracks several streams, so two readers of one file do not reset each other's window. Prefetch fetches the blocks ahead concurrently: with `readahead=0` the client sends one READ at a time per reader (Spike A). The window grows per block a reader moves into, not per read call, because Linux splits reads into 128 KiB FUSE requests (docs/phase1.md).
 13. `internal/frontend/nfs/`: `nfs.Handler` with stable, self-describing file handles (version, kind, uuid, ops/path hash) instead of the path-LRU helper; billy adapter over `vfs`; `ConcurrentHandlers` 128; mount/unmount driver using the Spike A option string (§4.6). go-nfs calls `Lstat` on almost every RPC and `Open`+`Stat` on every READ, so both must be index-only. `HandleLimit` must be large because READDIR caps a reply at `HandleLimit()/2` entries, and the handler implements go-nfs's verifier cache so a large directory is not re-listed for every READDIR page.
-14. `internal/frontend/fuse/` (linux): go-fuse node adapter; `MaxReadAhead` and `MaxWrite` 1 MiB; entry/attr timeouts from vfs hints.
+14. `internal/frontend/fuse/` (linux): go-fuse node adapter; `MaxReadAhead` and `MaxWrite` 1 MiB; entry/attr timeouts from vfs hints. Mounts as the user through `fusermount3`; `DirectMount` uses mount(2) where allowed, such as root in a container.
 15. `ucfs mount <dir> --read-only` (default on in this phase; on macOS it adds `rdonly`, which stops Finder's `.DS_Store` writes and SETATTRs, Spike C), `ucfs umount <dir>`, `ucfs status` (counters over the control socket).
-16. Index sync loop: incremental listing every 30 s from the stored cursor; `removed=true` sweep every 10 min; CDN 404 marks a file removed and refreshes its info.
+16. Index sync loop: incremental listing every 30 s from the stored cursor; `removed=true` sweep every 10 min; a CDN 404 refreshes the file's info over REST, and only REST decides that it is removed.
 
 Acceptance: on this Mac without installing anything, `ls`, `cat`, `open` an image in Preview and `rsync` a subset out all
 work; two shells reading different files concurrently show no mutual stall; `ucfs status` shows CDN bytes close to the
 sum of file sizes read, and a `ls -lR` costs zero CDN bytes. The same on a Linux VM through FUSE.
+Measured in [docs/phase1.md](docs/phase1.md): CDN bytes equal the bytes read exactly, and `ls -lR` costs 0 B on both
+macOS and Linux.
 
 ### Phase 2: Variants as paths (≈ 2 days)
 
@@ -107,7 +109,8 @@ Acceptance: `cp files/<uuid>/-/resize/1200x/-/format/webp/hero.webp .` produces 
     length as a no-op (macOS `cp` issues one after every write, Spike C); commit = upload with
     `UPLOADCARE_STORE=1`, part filename = written name (`original_filename`), base upload ≤ 100 MB, multipart above.
     Base upload keeps only what follows the last `\` in a name (Spike D), so names containing `\` fail with `EINVAL`
-    until the `ucfs:name` fallback exists.
+    until the `ucfs:name` fallback exists. Projects can restrict upload file types: `uploadcare-go-test` rejects a
+    random binary with "Uploading of these file types is not allowed" (validation error), which maps to `EPERM`.
 22. Commit triggers: FUSE `Flush` (blocking, error returned to the writer); NFS `COMMIT` or 3 s idle after the last
     `WRITE`. Zero-length files stay local until written or removed (documented limitation; the API itself accepts
     empty files, Spike D).
@@ -196,13 +199,15 @@ sync_state(key TEXT PRIMARY KEY, value TEXT);  -- list cursor, last full scan, l
 ### 4.3 Node ids and NFS file handles
 
 `NodeID` is a 64-bit FNV-1a hash of `(view, uuid, ops-or-path)`; collisions are detected at insert and resolved by
-rehashing with a salt stored in the index. NFS file handles are self-describing (`version:1 byte, kind:1 byte,
+rehashing with a salt stored in the index (deferred to Phase 5: Phase 1 uses the plain hash, about 3·10⁻⁸ collision
+chance at 1 M files). NFS file handles are self-describing (`version:1 byte, kind:1 byte, reserved:2 bytes,
 uuid:16 bytes, hash:8 bytes`), so a restarted daemon serves old handles without a path cache and never returns
-`ESTALE` for files that still exist.
+`ESTALE` for files that still exist. Handles must be a multiple of 4 bytes long: go-nfs reads them with
+`xdr.ReadOpaque`, which skips no XDR padding, and a 26-byte handle made every ACCESS reply deny everything.
 
 ### 4.4 Read path
 
-Open → sequential detector per handle → block cache (`<cache>/blocks/<uuid-or-hash>/<blockno>`) → singleflight →
+Open → sequential detector per object (streams per reader) → block cache (`<cache>/blocks/<uuid-or-hash>/<blockno>`) → singleflight →
 ranged `GET`. Prefetch window starts at 1 MiB and doubles while reads stay sequential, up to 16 MiB, bounded by the
 traffic budget. Originals never revalidate; variants expire after 24 h.
 
@@ -217,8 +222,9 @@ journal → spool removal. Replacement of an existing name follows `--on-overwri
 macOS, run as the user: `mount_nfs -o port=P,mountport=P,vers=3,tcp,locallocks,noresvport,rsize=1048576,
 wsize=1048576,readahead=0,nfc,soft,intr,acregmax=3600,acdirmax=5,nobrowse[,rdonly] 127.0.0.1:/ <dir>`. Without
 `rsize`/`wsize` the client negotiates 32 KiB. `readahead=0` is a traffic choice: at 1 MiB blocks the client's default
-read-ahead turns a 4 KiB read into 16 MiB of traffic. It also makes cold sequential speed depend entirely on daemon
-prefetch, so Phase 1 re-measures it against a read-ahead of 2–4. `127.0.0.1`, not `localhost`, which can
+read-ahead turns a 4 KiB read into 16 MiB of traffic. Re-measured in Phase 1 with the daemon's concurrent prefetch:
+cold `cat` of 16 MB takes the same 1.4–1.5 s at `readahead` 0 and 2, while `head -c 4096` costs 1 MiB at 0 and 2 MiB
+at 2, so 0 stays the default and `--readahead` overrides it. `127.0.0.1`, not `localhost`, which can
 resolve to `::1`. `nobrowse` keeps the mount out of the Finder sidebar; `rdonly` while read-only. Linux FUSE:
 `fsname=ucfs`, `noatime`, `max_read=1048576`, no `allow_other`.
 
