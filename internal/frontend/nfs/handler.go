@@ -2,12 +2,14 @@
 package nfs
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net"
 	"os"
 	"path"
@@ -51,8 +53,10 @@ func (h *handler) Mount(context.Context, net.Conn, gonfs.MountRequest) (gonfs.Mo
 	return gonfs.MountStatusOk, h.fs, []gonfs.AuthFlavor{gonfs.AuthFlavorNull}
 }
 
-// Change returns nil: the export is read-only.
-func (h *handler) Change(billy.Filesystem) billy.Change { return nil }
+// Change accepts mode, owner and time changes and ignores them: files are
+// immutable once uploaded, and cp and Finder set these on every copy
+// (Spike C). Without a changer every CREATE that carries a mode would fail.
+func (h *handler) Change(billy.Filesystem) billy.Change { return h.fs }
 
 func (h *handler) FSStat(context.Context, billy.Filesystem, *gonfs.FSStat) error { return nil }
 
@@ -89,13 +93,17 @@ func encodeHandle(n vfs.Node) []byte {
 
 var errStale = errors.New("stale file handle")
 
+// zeroUUID stands for an object whose inode number was drawn at random
+// and so has no key.
+var zeroUUID [16]byte
+
 func (h *handler) decodeHandle(ctx context.Context, b []byte) (vfs.Node, error) {
 	if len(b) != handleLen || b[0] != handleVersion {
 		return vfs.Node{}, errStale
 	}
 	kind := vfs.Kind(b[1])
 	var uuid string
-	if kind.HasUUID() {
+	if kind.HasUUID() && !bytes.Equal(b[4:20], zeroUUID[:]) {
 		x := hex.EncodeToString(b[4:20])
 		uuid = x[0:8] + "-" + x[8:12] + "-" + x[12:16] + "-" + x[16:20] + "-" + x[20:32]
 	}
@@ -153,17 +161,30 @@ func (h *handler) DataForVerifier(p string, v uint64) []fs.FileInfo {
 }
 
 // billyFS adapts vfs.FS to the path-based billy interface go-nfs uses. Every
-// method except file reads is answered from the index.
+// method except file reads and writes is answered from the index.
 type billyFS struct {
 	v        *vfs.FS
 	uid, gid uint32
 }
 
+var (
+	_ billy.Change    = (*billyFS)(nil)
+	_ gonfs.Committer = (*billyFS)(nil)
+)
+
 func pathErr(op, name string, err error) error {
 	return &fs.PathError{Op: op, Path: name, Err: err}
 }
 
-func (b *billyFS) Capabilities() billy.Capability { return billy.ReadCapability | billy.SeekCapability }
+// Capabilities include writing when the mount is writable; go-nfs answers
+// every write procedure with ROFS otherwise.
+func (b *billyFS) Capabilities() billy.Capability {
+	c := billy.ReadCapability | billy.SeekCapability
+	if b.v.Writable() {
+		c |= billy.WriteCapability | billy.TruncateCapability
+	}
+	return c
+}
 
 func (b *billyFS) info(e vfs.Entry) *fileInfo {
 	nlink := uint32(1)
@@ -211,22 +232,119 @@ func (b *billyFS) Open(name string) (billy.File, error) {
 	return &file{v: b.v, name: name, node: e.Node}, nil
 }
 
+// OpenFile opens for writing when asked: go-nfs opens with O_RDWR for every
+// WRITE and with O_WRONLY|O_EXCL to apply a SETATTR of the size.
 func (b *billyFS) OpenFile(name string, flag int, _ os.FileMode) (billy.File, error) {
-	if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC|os.O_APPEND) != 0 {
-		return nil, pathErr("open", name, syscall.EROFS)
+	if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC|os.O_APPEND) == 0 {
+		return b.Open(name)
 	}
-	return b.Open(name)
+	ctx := context.Background()
+	e, err := b.v.Walk(ctx, name)
+	if errors.Is(err, syscall.ENOENT) && flag&os.O_CREATE != 0 {
+		return b.Create(name)
+	}
+	if err != nil {
+		return nil, pathErr("open", name, err)
+	}
+	if err := b.v.OpenWrite(ctx, e.Node, flag&os.O_TRUNC != 0); err != nil {
+		return nil, pathErr("open", name, err)
+	}
+	return &file{v: b.v, name: name, node: e.Node}, nil
+}
+
+// parent resolves the directory of a path and the last component.
+func (b *billyFS) parent(ctx context.Context, name string) (vfs.Node, string, error) {
+	dir, base := path.Split(path.Clean("/" + name))
+	e, err := b.v.Walk(ctx, dir)
+	return e.Node, base, err
 }
 
 func (b *billyFS) Create(name string) (billy.File, error) {
-	return nil, pathErr("create", name, syscall.EROFS)
+	ctx := context.Background()
+	dir, base, err := b.parent(ctx, name)
+	if err != nil {
+		return nil, pathErr("create", name, err)
+	}
+	e, err := b.v.Create(ctx, dir, base)
+	if err != nil {
+		return nil, pathErr("create", name, err)
+	}
+	return &file{v: b.v, name: name, node: e.Node}, nil
 }
-func (b *billyFS) Rename(from, _ string) error { return pathErr("rename", from, syscall.EROFS) }
-func (b *billyFS) Remove(name string) error    { return pathErr("remove", name, syscall.EROFS) }
+
+func (b *billyFS) Rename(from, to string) error {
+	ctx := context.Background()
+	fdir, fbase, err := b.parent(ctx, from)
+	if err != nil {
+		return pathErr("rename", from, err)
+	}
+	tdir, tbase, err := b.parent(ctx, to)
+	if err != nil {
+		return pathErr("rename", to, err)
+	}
+	if err := b.v.Rename(ctx, fdir, fbase, tdir, tbase); err != nil {
+		return pathErr("rename", from, err)
+	}
+	return nil
+}
+
+// Remove serves both REMOVE and RMDIR, as go-nfs calls it for either.
+func (b *billyFS) Remove(name string) error {
+	ctx := context.Background()
+	dir, base, err := b.parent(ctx, name)
+	if err != nil {
+		return pathErr("remove", name, err)
+	}
+	e, err := b.v.Lookup(ctx, dir, base)
+	if err != nil {
+		return pathErr("remove", name, err)
+	}
+	if e.Node.IsDir() {
+		err = b.v.Rmdir(ctx, dir, base)
+	} else {
+		err = b.v.Remove(ctx, dir, base)
+	}
+	if err != nil {
+		return pathErr("remove", name, err)
+	}
+	return nil
+}
+
+// MkdirAll makes the last component only: go-nfs checks that the parent
+// exists before it calls.
 func (b *billyFS) MkdirAll(name string, _ os.FileMode) error {
-	return pathErr("mkdir", name, syscall.EROFS)
+	ctx := context.Background()
+	dir, base, err := b.parent(ctx, name)
+	if err != nil {
+		return pathErr("mkdir", name, err)
+	}
+	if _, err := b.v.Mkdir(ctx, dir, base); err != nil {
+		return pathErr("mkdir", name, err)
+	}
+	return nil
 }
-func (b *billyFS) Symlink(_, link string) error { return pathErr("symlink", link, syscall.EROFS) }
+
+// Commit is NFS COMMIT, which go-nfs passes on because billyFS implements
+// gonfs.Committer: it starts the upload of a written file.
+func (b *billyFS) Commit(name string) error {
+	ctx := context.Background()
+	slog.Debug("nfs commit", "path", name)
+	e, err := b.v.Walk(ctx, name)
+	if err != nil {
+		return pathErr("commit", name, err)
+	}
+	if err := b.v.Commit(ctx, e.Node); err != nil {
+		return pathErr("commit", name, err)
+	}
+	return nil
+}
+
+func (b *billyFS) Chmod(string, os.FileMode) error            { return nil }
+func (b *billyFS) Lchown(string, int, int) error              { return nil }
+func (b *billyFS) Chown(string, int, int) error               { return nil }
+func (b *billyFS) Chtimes(string, time.Time, time.Time) error { return nil }
+
+func (b *billyFS) Symlink(_, link string) error { return pathErr("symlink", link, syscall.EPERM) }
 func (b *billyFS) Readlink(link string) (string, error) {
 	return "", pathErr("readlink", link, syscall.EINVAL)
 }
@@ -251,8 +369,9 @@ func (f *fileInfo) ModTime() time.Time { return f.e.Attr.Mtime }
 func (f *fileInfo) IsDir() bool        { return f.e.Node.IsDir() }
 func (f *fileInfo) Sys() any           { return f.sys }
 
-// file is opened afresh for every READ RPC, so it holds no state worth
-// sharing; the cache tracks sequential access per object instead.
+// file is opened afresh for every READ and WRITE RPC, so it holds no state
+// worth sharing; the cache tracks sequential access per object instead, and
+// the spool what was written.
 type file struct {
 	v    *vfs.FS
 	name string
@@ -284,8 +403,22 @@ func (f *file) Seek(offset int64, whence int) (int64, error) {
 	return f.off, nil
 }
 
-func (f *file) Write([]byte) (int, error) { return 0, pathErr("write", f.name, syscall.EROFS) }
-func (f *file) Truncate(int64) error      { return pathErr("truncate", f.name, syscall.EROFS) }
-func (f *file) Close() error              { return nil }
-func (f *file) Lock() error               { return nil }
-func (f *file) Unlock() error             { return nil }
+func (f *file) Write(p []byte) (int, error) {
+	n, err := f.v.WriteAt(context.Background(), f.node, p, f.off)
+	f.off += int64(n)
+	if err != nil {
+		return n, pathErr("write", f.name, err)
+	}
+	return n, nil
+}
+
+func (f *file) Truncate(size int64) error {
+	if err := f.v.Truncate(context.Background(), f.node, size); err != nil {
+		return pathErr("truncate", f.name, err)
+	}
+	return nil
+}
+
+func (f *file) Close() error  { return nil }
+func (f *file) Lock() error   { return nil }
+func (f *file) Unlock() error { return nil }

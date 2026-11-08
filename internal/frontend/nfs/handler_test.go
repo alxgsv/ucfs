@@ -3,6 +3,7 @@ package nfs
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"github.com/willscott/go-nfs-client/nfs/rpc"
 
 	"github.com/alxgsv/ucfs/internal/fake"
+	"github.com/alxgsv/ucfs/internal/spool"
 	"github.com/alxgsv/ucfs/internal/vfs"
 	"github.com/alxgsv/ucfs/internal/vfs/vfstest"
 )
@@ -217,5 +219,212 @@ func TestVariantsOverRPC(t *testing.T) {
 	}
 	if _, _, err := target.Lookup("/files/" + uuid(1) + "/-/nosuchop"); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("lookup of an unknown operation: %v, want NFS3ERR_NOENT", err)
+	}
+}
+
+func writableEnv(t *testing.T, files ...fake.File) *vfstest.Env {
+	t.Helper()
+	env := vfstest.New(t, files...)
+	// A grace of a nanosecond makes a file immutable as soon as it is uploaded.
+	env.Writable(t, spool.Options{Metadata: map[string]string{"ucfs:test": "1"}, RecentGrace: time.Nanosecond}, &vfs.Writes{})
+	return env
+}
+
+func waitSpools(t *testing.T, env *vfstest.Env) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for len(env.Spools.List()) > 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("spools left: %+v", env.Spools.List())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func nfsErr(err error) uint32 {
+	var nerr *nfsc.Error
+	if errors.As(err, &nerr) {
+		return nerr.ErrorNum
+	}
+	return 0
+}
+
+func TestWritesOverRPC(t *testing.T) {
+	env := writableEnv(t, fake.File{UUID: uuid(1), Name: "fixture.jpg", Size: 10, Uploaded: t0})
+	target := mount(t, env)
+
+	if _, err := target.Mkdir("/tree/photos", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := bytes.Repeat([]byte("0123456789"), 300000)
+	f, err := target.OpenFile("/tree/photos/photo.jpg", 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("COMMIT: %v", err)
+	}
+	waitSpools(t, env)
+
+	r, err := target.Open("/tree/photos/photo.jpg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(r)
+	_ = r.Close()
+	if err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("read back %d bytes, %v", len(got), err)
+	}
+	same := nfsc.Sattr3{Size: nfsc.SetSize{SetIt: true, Size: uint64(len(body))}}
+	if err := target.Setattr("/tree/photos/photo.jpg", same); err != nil {
+		t.Errorf("truncate to the same length: %v", err)
+	}
+	shorter := nfsc.Sattr3{Size: nfsc.SetSize{SetIt: true, Size: 5}}
+	if err := target.Setattr("/tree/photos/photo.jpg", shorter); nfsErr(err) != nfsc.NFS3ErrNotSupp {
+		t.Errorf("truncate an uploaded file to 5 bytes: %v, want NFS3ERR_NOTSUPP", err)
+	}
+
+	if err := target.Rename("/tree/photos/photo.jpg", "/tree/photo.jpg"); err != nil {
+		t.Fatal(err)
+	}
+	e, err := env.FS.Walk(context.Background(), "tree/photo.jpg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	o, err := env.FS.Resolve(context.Background(), "tree/photo.jpg", env.Journal)
+	if err != nil || o.State != vfs.StateUploaded {
+		t.Fatalf("resolve: %+v, %v", o, err)
+	}
+	if sf, _ := env.Fake.File(o.UUID); sf.Metadata["ucfs:path"] != "/photo.jpg" || sf.Name != "photo.jpg" {
+		t.Errorf("renamed file %+v", sf)
+	}
+	_ = e
+
+	sc, err := target.OpenFile("/tree/._photo.jpg", 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sc.Write([]byte("AppleDouble")); err != nil {
+		t.Fatal(err)
+	}
+	_ = sc.Close()
+
+	if err := target.Remove("/tree/photo.jpg"); err != nil {
+		t.Fatal(err)
+	}
+	if sf, _ := env.Fake.File(o.UUID); !sf.Removed {
+		t.Error("rm did not soft-delete")
+	}
+	if err := target.RmDir("/tree/photos"); err != nil {
+		t.Errorf("rmdir: %v", err)
+	}
+	// The client turns NFS3ERR_PERM, and only it, into os.ErrPermission.
+	if err := target.Remove("/tree/_inbox/fixture.jpg"); !errors.Is(err, os.ErrPermission) {
+		t.Errorf("rm of a fixture: %v, want NFS3ERR_PERM", err)
+	}
+	if _, err := target.Create("/files/"+uuid(1)+"/x", 0o644); nfsErr(err) != nfsc.NFS3ErrROFS {
+		t.Errorf("create in files/<uuid>/: %v, want NFS3ERR_ROFS", err)
+	}
+	if st := env.Fake.UploadStats(); st.Base != 1 {
+		t.Errorf("%d uploads, want only photo.jpg", st.Base)
+	}
+}
+
+func TestDirectoryHandleSurvivesRename(t *testing.T) {
+	env := writableEnv(t)
+	h := newHandler(env.FS)
+	ctx := context.Background()
+	tree, err := env.FS.Walk(ctx, "tree")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.FS.Mkdir(ctx, tree.Node, "a"); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := env.FS.Walk(ctx, "tree/a")
+	if _, err := env.FS.Mkdir(ctx, a.Node, "sub"); err != nil {
+		t.Fatal(err)
+	}
+	old := h.ToHandle(h.fs, []string{"tree", "a"})
+	oldSub := h.ToHandle(h.fs, []string{"tree", "a", "sub"})
+	if err := env.FS.Rename(ctx, tree.Node, "a", tree.Node, "b"); err != nil {
+		t.Fatal(err)
+	}
+	for b, want := range map[string]string{string(old): "tree/b", string(oldSub): "tree/b/sub"} {
+		_, p, err := h.FromHandle([]byte(b))
+		if err != nil || strings.Join(p, "/") != want {
+			t.Errorf("old handle resolves to %q, %v; want %s", p, err, want)
+		}
+		n, err := h.decodeHandle(ctx, []byte(b))
+		if err != nil || binary.BigEndian.Uint64([]byte(b)[20:]) != n.ID() {
+			t.Errorf("old handle's node %+v keeps id? %v", n, err)
+		}
+	}
+}
+
+// vim with backupcopy=no saves by renaming the original to name~, writing a
+// new file under the name and removing the backup. On NFS the client then
+// holds the original's handle for the backup and gets a new one for the new
+// file, so the two must stay apart.
+func TestRenameBackupSaveOverRPC(t *testing.T) {
+	env := writableEnv(t)
+	target := mount(t, env)
+	write := func(p, body string) {
+		t.Helper()
+		f, err := target.OpenFile(p, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.Write([]byte(body)); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		waitSpools(t, env)
+	}
+	write("/tree/note.txt", "first line\n")
+	_, oldFH, err := target.Lookup("/tree/note.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1, _ := env.FS.Resolve(context.Background(), "tree/note.txt", env.Journal)
+
+	if err := target.Rename("/tree/note.txt", "/tree/note.txt~"); err != nil {
+		t.Fatal(err)
+	}
+	write("/tree/note.txt", "first line\nsecond line\n")
+	_, newFH, err := target.Lookup("/tree/note.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(oldFH, newFH) {
+		t.Error("the new file got the handle of the renamed original")
+	}
+	if err := target.Remove("/tree/note.txt~"); err != nil {
+		t.Fatal(err)
+	}
+
+	v2, err := env.FS.Resolve(context.Background(), "tree/note.txt", env.Journal)
+	if err != nil || v2.State != vfs.StateUploaded || v2.UUID == v1.UUID {
+		t.Fatalf("after the save: %+v, %v", v2, err)
+	}
+	if f, _ := env.Fake.File(v2.UUID); f.Name != "note.txt" || f.Metadata["ucfs:path"] != "/note.txt" {
+		t.Errorf("saved file %+v", f)
+	}
+	if f, _ := env.Fake.File(v1.UUID); !f.Removed {
+		t.Error("the backup, the previous version, was not deleted")
+	}
+	entries, err := target.ReadDirPlus("/tree")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.FileName, ".nfs") || strings.HasSuffix(e.FileName, "~") {
+			t.Errorf("left over: %s", e.FileName)
+		}
 	}
 }
