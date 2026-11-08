@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -85,6 +86,7 @@ func (c *Client) ReadRange(ctx context.Context, uuid, ops string, p []byte, off 
 	}
 	n, err := io.ReadFull(resp.Body, p)
 	c.bytes.Add(int64(n))
+	slog.Debug("cdn read", "uuid", uuid, "ops", ops, "off", off, "bytes", n)
 	return n, err
 }
 
