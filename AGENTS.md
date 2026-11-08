@@ -29,20 +29,22 @@ make cross        # builds for linux/amd64, linux/arm64, darwin/amd64
 make snapshot     # goreleaser: dist/ with the release archives and formula, nothing published
 ```
 
-`make build test lint` must pass before every commit. With PR #6 (Phase 5): `make race` runs the tests with the race
-detector, which needs cgo; run it on Linux, as CI does, for example in an OrbStack VM with Go, since the FUSE tests
-only run there. `make bench` prints the benchmark table and `make soak SOAK=24h` runs the soak against the fake.
+In a git worktree inside another checkout (such as `.claude/worktrees/<name>`), build with
+`GOFLAGS=-buildvcs=false`: otherwise Go stamps the binary from the outer checkout and runs `git status` in it.
 
-Tests that mount: the FUSE tests in `internal/frontend/fuse` skip without a usable `/dev/fuse`; with PR #6,
-`UCFS_MOUNT_TESTS=1` makes `cmd/ucfs` tests mount a fake project for real (NFS on macOS, FUSE on Linux) and fail,
-rather than skip, when they cannot. To run tests on a Linux host without Go, cross-compile them:
+`make build test lint` must pass before every commit. `make race` runs the tests with the race detector, which needs
+cgo; run it on Linux, as CI does, for example in an OrbStack VM with Go, since the FUSE tests only run there. `make bench` prints the benchmark table and `make soak SOAK=24h` runs the soak against the fake.
+
+Tests that mount: the FUSE tests in `internal/frontend/fuse` skip without a usable `/dev/fuse`, and fail instead with
+`UCFS_MOUNT_TESTS=1`, as CI sets; the `cmd/ucfs` tests that mount a fake project for real (NFS on macOS, FUSE on
+Linux) run only with `UCFS_MOUNT_TESTS=1`. To run tests on a Linux host without Go, cross-compile them:
 `GOOS=linux go test -c -o fuse.test ./internal/frontend/fuse/` and copy the binary there.
 
 ## Live checks
 
 There is no live test in `go test`: everything there runs against `internal/fake`. Acceptance is measured by hand
 against a real project, with the scripts in `spikes/measure/` (they take the binary in `UCFS_BIN` and global flags
-in `UCFS_FLAGS`) and, with PR #6, the soak's `UCFS_SOAK_LIVE=<project>`. They need:
+in `UCFS_FLAGS`) and the soak's `UCFS_SOAK_LIVE=<project>`. They need:
 
 - credentials in `~/.uploadcare/config.yaml` for a project the maintainer names for the task. Pass `--project` on
   every command: the default project may be another one. Never use a project you were told is limited.
@@ -71,8 +73,8 @@ Where things are:
 
 - Mount registry: `<user cache dir>/ucfs/mounts/<hash>.json` (`~/Library/Caches/ucfs/mounts/` on macOS,
   `~/.cache/ucfs/mounts/` on Linux), one record per running mount with its directory, socket and pid.
-- Control sockets: `<cache dir>/ctl-<hash>.sock`, or `$TMPDIR/ucfs-<hash>-<hash>.sock` when that path is too long
-  (`$TMPDIR/ucfs-<uid>/<hash>-<hash>.sock` with PR #6).
+- Control sockets: `<cache dir>/ctl-<hash>.sock`, or `$TMPDIR/ucfs-<uid>/<hash>-<hash>.sock` when that path is too
+  long.
 - `--daemon` logs: `<cache dir>/mount-<hash>.log`.
 - A mount left by a dead daemon: `ucfs umount <dir>` forces it off ([docs/troubleshooting.md](docs/troubleshooting.md)).
 

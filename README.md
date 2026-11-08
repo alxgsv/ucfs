@@ -87,10 +87,12 @@ so a stray `rm -r` cannot empty a project. `--read-only` refuses every write.
 - The project is the source of truth: files other clients upload appear after the next sync (30 s), and their
   metadata and tag changes after `--meta-ttl` (5 min) or `ucfs index sync --full`.
 - Finder and Quick Look read every image they show a thumbnail for, in full. See [docs/finder.md](docs/finder.md)
-  and [docs/costs.md](docs/costs.md) for what costs CDN traffic.
+  and [docs/costs.md](docs/costs.md) for what costs CDN traffic; `--traffic-budget 2GiB` caps a day's.
 - No hard links, symbolic links or special files. `chmod`, `chown` and `touch` succeed and change nothing; a
   file's time is its upload time. Renaming a directory updates each file below it, one request each, and is not
   atomic. Empty files are not uploaded. [docs/semantics.md](docs/semantics.md) has the details.
+- On macOS the mount is served by NFS on a loopback port. Other users cannot use the mount point, but any local
+  process that finds the port can read the project through it ([PLAN.md](PLAN.md) item 45).
 - A daemon that crashes leaves its mount behind; `ucfs umount <dir>` forces it off
   ([docs/troubleshooting.md](docs/troubleshooting.md)).
 

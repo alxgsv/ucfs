@@ -5,7 +5,8 @@ Homebrew 7.0.12, goreleaser 2.14.3 (Homebrew) and 2.20.0 (`go install …@latest
 host: Ubuntu 26.04.1 on x86_64, `/bin/sh` is dash, systemd 259, no Go. Live checks used `alex-gusev-test`, always with
 `--project alex-gusev-test`, `--read-only` and a cache dir of their own (one exception, see the systemd unit), and
 ran while Phase 5's soak mounts were up on the Mac, without touching them; they read one 4,859-byte image and
-listed names.
+listed names. After Phase 5 merged, `main` (b1d66ed) was merged in and the docs and the short live checks were done
+again on 2026-11-09 ([After the Phase 5 merge](#after-the-phase-5-merge)).
 `$S` is the session's scratch directory.
 
 | Item | Check | Result |
@@ -21,6 +22,7 @@ listed names.
 | 42 | docs | flags from `--help` of `main` and of `origin/phase-5`; claims checked against the code |
 | 43 | `AGENTS.md`, `CLAUDE.md` | written; `CLAUDE.md` is `@AGENTS.md` |
 | all | `make build test lint` | pass; 0 lint issues for darwin and linux |
+| 41, 42 | after the Phase 5 merge | docs rechecked, marks removed; `--daemon` 0.11 s, launchd agent 2 s, systemd unit 2 s, all read-only, 2 REST requests and 0 CDN bytes in all; `make build test lint` pass |
 
 ## 40: release build
 
@@ -91,8 +93,9 @@ held the examples. Installing by the full name added the formula to `~/.homebrew
 load third-party taps only when trusted), and uninstalling removed it again.
 
 **Workflow.** `.github/workflows/release.yml` parses (Ruby's YAML: checkout, setup-go, `go test ./...`,
-goreleaser-action v7). actionlint was not run: installing it was refused in this session. Actions cannot start jobs
-on this account, so the workflow itself has not run.
+goreleaser-action v7). actionlint was not run: installing it was refused in this session. Actions could not start
+jobs on this account during the phase, so the workflow itself has not run; it runs only for a `v*` tag. Phase 5's
+`ci.yml` runs on this pull request since the merge.
 
 **What the fresh-Mac test still needs:** a Mac with Gatekeeper on, and the release (public repository, tag
 `v0.1.0`) or the snapshot served to it: the install script, a browser download, and a first `ucfs mount`. Steps in
@@ -173,21 +176,69 @@ The second run, with both fixes:
 
 The flag tables in [mount-options.md](mount-options.md) come from `--help` of every command, built from this branch
 and from `git archive origin/phase-5` in a scratch directory: Phase 5 adds `--insecure-config`, `--traffic-budget`,
-`--max-inflight`, `ucfs index refresh` and the status fields marked "PR #6", and this branch adds `--daemon`. The
+`--max-inflight`, `ucfs index refresh` and new status fields, and this branch adds `--daemon`. The
 claims in each page were checked against the code, and the measured ones against the phase reports;
 [semantics.md](semantics.md) marks with † the errors seen on a real mount and says where the macOS NFS client's
 translation is not measured. Things found while checking: there is no `ucfs umount -f` (plain `umount` forces a
 mount no daemon answers for); `ucfs umount` returns once the daemon closed its socket, while a writable daemon goes on
 uploading for up to 2 minutes; truncating a stored file to its own size works on FUSE but is `EROFS` over NFS. All
-relative links in the new pages resolve. `docs/phase5.md` is not on any branch yet; the pages point at PR #6 for
-what lands with it.
+relative links in the new pages resolve. Until Phase 5 merged, the pages marked what came with it "PR #6"; the
+merge removed the marks (below).
+
+## After the Phase 5 merge
+
+**Merge.** `git merge origin/main` (b1d66ed) became 3fd1926. Only `PLAN.md` conflicted, in the layout of §2, where both
+sides are kept; the `Makefile` (Phase 5's `race`, `bench` and `soak`, this branch's `snapshot`) and `cmd/ucfs/mount.go`
+(Phase 5's flags and `runMount`, this branch's `--daemon`) merged by themselves, and `mount --help` lists `--daemon`.
+`make build test lint` passed on the merged tree, 0 issues for darwin and linux.
+
+**Docs.** Every claim marked "PR #6" was checked against the merged code: the flags and their defaults against
+`--help` of every command (no flag missing or extra on either side), the `status --json` fields against the JSON tags
+in `internal/ctl`, the socket directory (`$TMPDIR/ucfs-<uid>/`), the config file error, degraded mode and its status
+line, names with `\` (uploaded with `_`, the whole name in `ucfs:name`), NFS `ACCESS` granted only to the daemon's uid
+and root, and direct I/O past the budget. All held. The marks are gone, the status fields are one table, and
+costs.md and troubleshooting.md link [phase5.md](phase5.md). One correction: `AGENTS.md` had `UCFS_MOUNT_TESTS=1`
+turning skips of the `cmd/ucfs` mount tests into failures; those tests run only with it, and it is the FUSE tests
+that then fail instead of skipping. The README's caveats now name `--traffic-budget` and the loopback NFS port any
+local process can reach (PLAN item 45). The items this phase defers are PLAN items 52–56.
+
+**Redaction.** The `--daemon` line (`mounted <dir>: pid N, log <path>`) went to stdout unredacted; with the default
+cache dir its log path holds the public key. It now goes through `redact()`, as errors and log lines do since Phase 5.
+Not run live with the default cache dir, which live checks do not use; the paths below, under `--cache-dir`, hold no
+key.
+
+**Live recheck** (`$S/recheck-mac.sh`, `~/ucfs-test/phase6/recheck-systemd.sh`), with the merged binary, each mount
+read-only on `alex-gusev-test` with this phase's cache dir and `status --json` read before unmounting:
+
+| Check | Seen |
+|---|---|
+| `ucfs mount --daemon` | returned in 0.11 s, mounted `nfs, nodev, nosuid, read-only, nobrowse`; 0 REST, 0 CDN; `ucfs umount` 0.10 s, registry empty after |
+| launchd agent (the example plist with the README's `sed`) | `plutil -lint` OK, mounted 2 s after `bootstrap`, `exit timeout = 60`; 2 REST, 0 CDN; `bootout` unmounted it, no plist, record or process left |
+| systemd unit on the Linux host | flags resolved from the drop-in, mounted after 2 s: `fuse.ucfs ro,nosuid,nodev,noatime,…`; 0 REST, 0 CDN; `disable --now` unmounted it, `NRestarts=0`, no unit or process left |
+
+- `--daemon` returns in 0.11 s, not 1.03 s: since Phase 5 a mount whose index was synced before serves at once and
+  lists in the background, so the daemon answers before any REST request.
+- The scratch cache dir's socket path is too long, so the `--daemon` mount and the launchd agent put their sockets in
+  `$TMPDIR/ucfs-501/`. The agent got the same per-user temp dir as the shell, and `status` and `umount` found it. On
+  Linux the socket fitted in the cache dir.
+- `ucfs version` prints Phase 6's line (version, commit, build date, Go, platform); Phase 5 did not change it. A
+  `make build` in this worktree printed commit b1d66ed with `vcs.modified=false`, while `git log -1` here gave 3fd1926
+  and the tree had changes. `git worktree list` showed the checkout this worktree sits in (`~/workspace/ucfs`) at
+  b1d66ed: Go stamped the build from that checkout, running `git status` and `git log` in it, and not from the
+  worktree, whose `.git` is a file. Every build of the binary here without `-buildvcs=false` did so (`make build`,
+  `make cross`, `make snapshot`). Later builds used `-buildvcs=false`, which prints `commit unknown`; `AGENTS.md`
+  now says so. PLAN item 53.
 
 ## Live budget and end state
 
-- CDN: 4,859 bytes (one PNG), 1 GET; no HEAD.
-- REST: about eleven listings, one per mount start (eleven mounts, each up for less than a minute, so before the
-  loop's first sync; a start that failed on a stale mount sent none), against a budget of 300. Uploads: none.
-- The Mac has no mount, daemon, launchd job or plist of this phase; its registry holds only Phase 5's record. The
-  Homebrew tap is gone and its trust entry removed; the local HTTP servers are stopped.
-- The Linux host has no mount, daemon, unit, drop-in or registry record of this phase, and no `~/.config/ucfs`.
-  `~/ucfs-test/phase6/` holds the snapshot binary, the scripts and test binaries, and the copied archive, no keys.
+- CDN: 4,859 bytes (one PNG), 1 GET; no HEAD. The recheck read nothing.
+- REST: about thirteen listings: one per mount start in the phase (eleven mounts, each up for less than a minute, so
+  before the loop's first sync; a start that failed on a stale mount sent none), and two by the launchd agent in the
+  recheck. Budget: 300. Uploads: none.
+- The Mac has no mount, daemon, launchd job or plist of this phase, and its registry is empty (Phase 5's record was
+  already gone when the recheck started). The Homebrew tap is gone and its trust entry removed; the local HTTP
+  servers are stopped. `$S/live/cache`, the test index, is removed.
+- The Linux host has no mount, daemon, unit, drop-in, slice or registry record of this phase, and no `~/.config/ucfs`;
+  the test cache dir and `~/.cache/ucfs/mounts/` are removed. `~/.cache/ucfs/` is left, empty: it predates this
+  phase's work on the host.
+  `~/ucfs-test/phase6/` holds the merged binary, the scripts and test binaries, and the copied archive, no keys.

@@ -58,7 +58,8 @@ func runDaemon(ctx context.Context, g *globalFlags, dir string, out io.Writer) e
 	if err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(out, "mounted %s: pid %d, log %s\n", dir, pid, logPath)
+	// The log is in the cache dir, which is named after the public key by default.
+	_, err = fmt.Fprintln(out, redact(fmt.Sprintf("mounted %s: pid %d, log %s", dir, pid, logPath)))
 	return err
 }
 

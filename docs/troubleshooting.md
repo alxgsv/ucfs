@@ -24,10 +24,10 @@ it was being written stays in `ucfs spool list`.
 ## The registry and control sockets
 
 Each running mount has a control socket, which `status`, `umount`, `resolve` and `spool` talk to:
-`<cache dir>/ctl-<hash>.sock`, or, when that path is too long for a socket, `$TMPDIR/ucfs-<hash>-<hash>.sock`
-(`$TMPDIR/ucfs-<uid>/<hash>-<hash>.sock` with PR #6). Mounts are recorded in `<user cache dir>/ucfs/mounts/<hash>.json`
-(`~/Library/Caches/ucfs/mounts/` on macOS, `~/.cache/ucfs/mounts/` on Linux) with their directory, socket and pid, so
-commands find them whatever `--cache-dir` they use. `ucfs status` without a directory removes records whose socket
+`<cache dir>/ctl-<hash>.sock`, or, when that path is too long for a socket, `$TMPDIR/ucfs-<uid>/<hash>-<hash>.sock`.
+Mounts are recorded in `<user cache dir>/ucfs/mounts/<hash>.json` (`~/Library/Caches/ucfs/mounts/` on macOS,
+`~/.cache/ucfs/mounts/` on Linux) with their directory, socket and pid, so commands find them whatever `--cache-dir`
+they use. `ucfs status` without a directory removes records whose socket
 is gone or refuses connections. A record left by a dead daemon is harmless; the next mount of that directory
 replaces it.
 
@@ -47,7 +47,7 @@ lock while it finishes uploads, up to 2 minutes.
 - "no project credentials found": neither the flags, the environment nor `~/.uploadcare/config.yaml` gave both keys.
 - "project not found in config": `--project`, `UPLOADCARE_PROJECT` or `default_project` names a project the file does
   not have.
-- "config file is readable by group or others" (PR #6): `chmod 600 ~/.uploadcare/config.yaml`, or pass
+- "config file is readable by group or others": `chmod 600 ~/.uploadcare/config.yaml`, or pass
   `--insecure-config`.
 
 ## "Operation denied", usage limits and throttling
@@ -55,10 +55,10 @@ lock while it finishes uploads, up to 2 minutes.
 The REST API answers `403 Operation denied` when the keys are wrong or the project's API access is suspended, for
 example over a usage limit; the CDN may keep serving files meanwhile. Check the project in the
 [dashboard](https://app.uploadcare.com). Without an index the first mount fails ("initial index sync"); with one, the
-mount keeps serving what the index holds and `ucfs status` shows the sync error. With PR #6 the mount enters degraded
-mode once the refusal has lasted a sync interval: reads go on, changes that need the API fail with `EACCES` (`EAGAIN`
-when throttled), and the `api` line of `ucfs status` ends with "API denied since <time>: <what the API said> (serving
-the index; writes refused)" until the API answers again.
+mount keeps serving what the index holds and `ucfs status` shows the sync error. Once the refusal has lasted a sync
+interval the mount is degraded: reads go on, changes that need the API fail with `EACCES` (`EAGAIN` when
+throttled), and the `api` line of `ucfs status` ends with "API denied since <time>: <what the API said> (serving
+the index; writes refused)" until the API answers again ([phase5.md](phase5.md#errors-and-the-degraded-api)).
 
 A `429 Too Many Requests` is retried, up to five times for REST requests, honouring `Retry-After`; what still fails
 is `EAGAIN`. Over NFS that is `NFS3ERR_JUKEBOX`: the macOS client retries it and gives up after about 28 seconds with
@@ -69,8 +69,7 @@ is `EAGAIN`. Over NFS that is `NFS3ERR_JUKEBOX`: the macOS client retries it and
 On macOS an upload error does not reach the program that wrote the file. `ucfs spool list` shows failed spools with
 their error; `ucfs spool retry --all` tries again; `ucfs spool drop <id>` discards one. Typical errors: "Uploading of
 these file types is not allowed" (the project restricts file types; `EPERM`), a file too large for the Upload API
-(`EFBIG`),
-a name with `\` (`EINVAL` before PR #6). On Linux the same errors come back from `close`.
+(`EFBIG`). On Linux the same errors come back from `close`.
 
 ## Linux
 
@@ -95,5 +94,6 @@ Open an issue at <https://github.com/alxgsv/ucfs/issues> with:
 - the exact command, what you expected and what happened;
 - `ucfs status --json <dir>` and the log, ideally with `-v`.
 
-Never include `~/.uploadcare/config.yaml` or the keys. Before PR #6, which redacts the keys from logs and errors,
-check what you paste: the default cache dir path contains the project's public key.
+Never include `~/.uploadcare/config.yaml` or the keys. ucfs writes `<public key>` and `<secret key>` in their place
+in its logs, errors and the `--daemon` line; check anything else you paste, since the default cache dir path
+contains the project's public key.

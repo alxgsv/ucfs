@@ -22,7 +22,7 @@ Taken on 2026-11-08:
 
 ## Releasing 0.1.0
 
-1. Merge the Phase 5 and Phase 6 pull requests.
+1. Merge the Phase 6 pull request.
 2. Scan the history for secrets before it goes public (for example `gitleaks git`); the phase reports name the test
    project and its CDN host, which are not secret.
 3. Make the repository public:

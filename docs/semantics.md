@@ -30,11 +30,11 @@ The tables below are for a writable mount.
 | `EPERM` | changing a foreign file without `--allow-foreign` †; an ordinary file at the root or in `tree/_inbox/`; `mkdir` outside `tree/`; a read-only extended attribute; an upload the project refuses (file type not allowed) |
 | `EXDEV` | a rename between views, such as `tree/` to `files/` |
 | `EOPNOTSUPP` | writing into an uploaded file without truncating it; hard links, symbolic links, special files (FUSE) |
-| `EINVAL` | a variant argument the CDN refuses †; a name with `\` † (accepted with PR #6); a rename into itself |
-| `EACCES` | the API refuses the keys (401, 403); with PR #6 also every change while the API keeps refusing (degraded mode) |
-| `EAGAIN` | the API throttles (429) after retries; an attribute set on a file being uploaded; NFS sends it as `NFS3ERR_JUKEBOX`, which the macOS client retries for about 28 s and then fails with `ETIMEDOUT` (measured in Phase 5) |
-| `EIO` | network errors and 5xx after retries; a failing index; with PR #6 a file that changed on the CDN during a read |
-| `EDQUOT` | the day's traffic budget is used up (PR #6, [costs.md](costs.md#traffic-budget)) |
+| `EINVAL` | a variant argument the CDN refuses †; a rename into itself |
+| `EACCES` | the API refuses the keys (401, 403); every change that needs the API while it keeps refusing (degraded mode) |
+| `EAGAIN` | the API throttles (429) after retries, and every change that needs the API while it keeps throttling (degraded mode); an attribute set on a file being uploaded; NFS sends it as `NFS3ERR_JUKEBOX`, which the macOS client retries for about 28 s and then fails with `ETIMEDOUT` (measured in Phase 5) |
+| `EIO` | network errors and 5xx after retries; a failing index; a file that changed on the CDN during a read |
+| `EDQUOT` | the day's traffic budget is used up ([costs.md](costs.md#traffic-budget)) |
 | `EFBIG` | a file too large for the Upload API |
 | `ENAMETOOLONG` | a `tree/` path over 512 characters; a metadata key over 64; a tag over 100 |
 
@@ -50,8 +50,8 @@ The tables below are for a writable mount.
 | read a shadow file | works, from the cache dir |
 | read `.ucfs/uploads.log` | the upload journal |
 
-On FUSE, a read that fails after the kernel has buffered part of the file reports `EIO` whatever the cause; with
-PR #6 a file larger than the traffic budget left is opened with direct I/O so that `EDQUOT` gets through.
+On FUSE, a read that fails after the kernel has buffered part of the file reports `EIO` whatever the cause, so a
+file larger than what the traffic budget has left is opened with direct I/O, which lets `EDQUOT` through.
 
 ## Creating and writing
 
@@ -64,7 +64,7 @@ PR #6 a file larger than the traffic budget left is opened with direct I/O so th
 | variants, views, `.ucfs/` | `EROFS` † | |
 | the root, `tree/_inbox/` | `EPERM` | shadow files work there |
 | any shadow name | works, kept local, never uploaded | |
-| a name with `\` | `EINVAL` † | PR #6 uploads it with `_` and keeps the name in `ucfs:name` |
+| a name with `\` | works | uploaded with `_` for each `\`, the whole name kept in metadata `ucfs:name`, which every view shows |
 | an empty file | works, stays local until written | never uploaded while empty |
 
 ## Truncate
@@ -135,8 +135,8 @@ by writing a temporary file and renaming it over the original (`NSDocument`, vim
 
 Attributes shown by `stat`:
 
-- Owner: the user who mounted, on every file. Other users: FUSE keeps them out (no `allow_other`); on NFS, `main`
-  answers every access check with yes, and PR #6 grants access only to the mounting user and root.
+- Owner: the user who mounted, on every file. Other users: FUSE keeps them out (no `allow_other`); on NFS, the
+  server grants access only to the mounting user and root, but any local process can reach its port ([PLAN.md](../PLAN.md) item 45).
 - Mode: stored files, variants and view files `0444`; tree files `0644` (`0444` on `--read-only`); writable folders
   (`files/`, `tree/` and its folders) `0755`, the rest `0555`.
 - Times: a stored or tree file's modification time is its upload time; a file being written, the last write; a

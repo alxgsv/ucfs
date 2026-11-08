@@ -80,8 +80,7 @@ A Finder copy of 50 images into `tree/` made 50 Upload API requests and no REST 
 
 ## Traffic budget
 
-**Lands with [PR #6](https://github.com/alxgsv/ucfs/pull/6) (Phase 5); described from the code, measured in
-docs/phase5.md once that is merged.**
+Measured in [phase5.md](phase5.md#traffic-budget).
 
 `--traffic-budget 2GiB` caps the CDN bytes a mount reads per calendar day in the local time zone:
 
