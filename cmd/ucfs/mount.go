@@ -105,7 +105,7 @@ func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) er
 	defer c.Wait()
 
 	loop := &index.Loop{Index: ix, Source: client, Interval: f.syncInterval, SweepEvery: f.sweepInterval}
-	fsys := vfs.New(ix, c, func(uuid string) { loop.Refresh(context.WithoutCancel(ctx), uuid) })
+	fsys := vfs.New(ix, c, cd, func(uuid string) { loop.Refresh(context.WithoutCancel(ctx), uuid) })
 	loop.Changed = fsys.Touch
 	loopCtx, stopLoop := context.WithCancel(ctx)
 	defer stopLoop()
@@ -135,13 +135,14 @@ func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) er
 			st.Index.SyncError = serr.Error()
 		}
 		cs := cd.Stats()
-		st.CDN = ctl.CDNStatus{Requests: cs.Requests, Bytes: cs.Bytes}
+		st.CDN = ctl.CDNStatus{Requests: cs.Requests, Heads: cs.Heads, Gets: cs.Gets, Bytes: cs.Bytes}
 		ks := c.Stats()
 		st.Cache = ctl.CacheStatus{Served: ks.Served, Hit: ks.Hit, FetchedDemand: ks.FetchedDemand,
 			FetchedPrefetch: ks.FetchedPrefetch, Used: ks.Used, Max: ks.Max}
 		return st
 	}
-	srv, err := ctl.Serve(ctl.SocketPath(cfg.CacheDir, dir), status, func() {
+	sock := ctl.SocketPath(cfg.CacheDir, dir)
+	srv, err := ctl.Serve(sock, status, func() {
 		select {
 		case unmountReq <- struct{}{}:
 		default:
@@ -151,6 +152,7 @@ func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) er
 		return errors.Join(err, m.Unmount())
 	}
 	defer func() { _ = srv.Close() }()
+	defer register(dir, sock)()
 
 	is, _ := ix.Stats(ctx)
 	slog.Info("mounted", "dir", dir, "frontend", f.frontend, "project", name, "files", is.Files)
@@ -164,4 +166,19 @@ func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) er
 		return nil
 	}
 	return m.Unmount()
+}
+
+// register records the mount in the registry of running mounts and returns
+// the function that removes the record. Without a record, status and umount
+// still find the mount when given the same --cache-dir.
+func register(dir, sock string) func() {
+	reg, err := ctl.RegistryDir()
+	if err == nil {
+		var unregister func()
+		if unregister, err = ctl.Register(reg, ctl.Mount{MountDir: dir, Socket: sock, PID: os.Getpid()}); err == nil {
+			return unregister
+		}
+	}
+	slog.Warn("mount not registered; status and umount need the same --cache-dir", "err", err)
+	return func() {}
 }

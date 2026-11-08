@@ -59,17 +59,21 @@ func (h *handler) FSStat(context.Context, billy.Filesystem, *gonfs.FSStat) error
 // Handle layout: version (1), kind (1), reserved (2), uuid (16), node id (8).
 // The length must be a multiple of 4: go-nfs reads handles with
 // xdr.ReadOpaque, which skips no XDR padding, so in ACCESS, COMMIT and
-// SETATTR the arguments after an unaligned handle would be misread.
+// SETATTR the arguments after an unaligned handle would be misread. A
+// variants view node does not fit its operations path in the handle; the
+// vfs keeps it by node id.
 const (
 	handleVersion = 1
 	handleLen     = 28
 )
 
 func (h *handler) ToHandle(_ billy.Filesystem, p []string) []byte {
-	e, err := h.fs.v.Walk(context.Background(), path.Join(p...))
+	ctx := context.Background()
+	e, err := h.fs.v.Walk(ctx, path.Join(p...))
 	if err != nil {
 		return nil
 	}
+	h.fs.v.Remember(ctx, e.Node)
 	return encodeHandle(e.Node)
 }
 
@@ -85,16 +89,18 @@ func encodeHandle(n vfs.Node) []byte {
 
 var errStale = errors.New("stale file handle")
 
-func decodeHandle(b []byte) (vfs.Node, error) {
+func (h *handler) decodeHandle(ctx context.Context, b []byte) (vfs.Node, error) {
 	if len(b) != handleLen || b[0] != handleVersion {
 		return vfs.Node{}, errStale
 	}
-	n := vfs.Node{Kind: vfs.Kind(b[1])}
-	if n.Kind == vfs.KindFile || n.Kind == vfs.KindFileDir {
+	kind := vfs.Kind(b[1])
+	var uuid string
+	if kind.HasUUID() {
 		x := hex.EncodeToString(b[4:20])
-		n.UUID = x[0:8] + "-" + x[8:12] + "-" + x[12:16] + "-" + x[16:20] + "-" + x[20:32]
+		uuid = x[0:8] + "-" + x[8:12] + "-" + x[12:16] + "-" + x[16:20] + "-" + x[20:32]
 	}
-	if binary.BigEndian.Uint64(b[20:]) != n.ID() {
+	n, err := h.fs.v.NodeByID(ctx, kind, uuid, binary.BigEndian.Uint64(b[20:]))
+	if err != nil {
 		return vfs.Node{}, errStale
 	}
 	return n, nil
@@ -103,11 +109,12 @@ func decodeHandle(b []byte) (vfs.Node, error) {
 // FromHandle must return a freshly allocated path: go-nfs appends to it, and
 // with concurrent handlers a shared backing array would be a data race.
 func (h *handler) FromHandle(b []byte) (billy.Filesystem, []string, error) {
-	n, err := decodeHandle(b)
+	ctx := context.Background()
+	n, err := h.decodeHandle(ctx, b)
 	if err != nil {
 		return nil, nil, err
 	}
-	p, err := h.fs.v.Path(context.Background(), n)
+	p, err := h.fs.v.Path(ctx, n)
 	if err != nil {
 		return nil, nil, errStale
 	}

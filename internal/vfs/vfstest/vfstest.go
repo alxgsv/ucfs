@@ -48,5 +48,5 @@ func New(t testing.TB, files ...fake.File) *Env {
 		t.Fatal(err)
 	}
 	t.Cleanup(c.Wait)
-	return &Env{FS: vfs.New(ix, c, nil), Fake: srv, Index: ix, Cache: c, CDN: cd, Client: client}
+	return &Env{FS: vfs.New(ix, c, cd, nil), Fake: srv, Index: ix, Cache: c, CDN: cd, Client: client}
 }

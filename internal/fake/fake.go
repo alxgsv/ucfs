@@ -11,8 +11,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -44,13 +46,15 @@ type File struct {
 type Server struct {
 	*httptest.Server
 
-	mu       sync.Mutex
-	files    []File
-	throttle int
-	requests int
-	latency  map[string]time.Duration
-	cdnReqs  int
-	cdnBytes int64
+	mu          sync.Mutex
+	files       []File
+	throttle    int
+	requests    int
+	latency     map[string]time.Duration
+	cdnReqs     int
+	cdnHeads    int
+	cdnBytes    int64
+	variantsGen int
 }
 
 func New(t testing.TB) *Server {
@@ -60,8 +64,8 @@ func New(t testing.TB) *Server {
 	rest.HandleFunc("GET /files/{uuid}/", s.fileInfo)
 	mux := http.NewServeMux()
 	mux.Handle("/", s.count(rest))
-	mux.HandleFunc("GET /cdn/{uuid}/", s.serveCDN)
-	mux.HandleFunc("HEAD /cdn/{uuid}/", s.serveCDN)
+	mux.HandleFunc("GET /cdn/{uuid}/{ops...}", s.serveCDN)
+	mux.HandleFunc("HEAD /cdn/{uuid}/{ops...}", s.serveCDN)
 	s.Server = httptest.NewServer(mux)
 	t.Cleanup(s.Close)
 	return s
@@ -80,6 +84,41 @@ func Content(uuid string, size int64) []byte {
 		b[i] = byte(r.Uint32())
 	}
 	return b
+}
+
+// BadArg is the argument the fake CDN rejects with 400, as the real one
+// rejects "-/resize/abc/".
+const BadArg = "bad"
+
+// Variant is what the fake CDN serves for an operations path such as
+// "-/resize/100x/-/format/webp/": deterministic bytes, a size derived from
+// the original's, and a weak ETag. ChangeVariants moves every variant to
+// new bytes and ETag of the same size.
+func (s *Server) Variant(uuid, ops string) (body []byte, etag, mime string) {
+	f, _ := s.find(uuid)
+	s.mu.Lock()
+	gen := s.variantsGen
+	s.mu.Unlock()
+	return variant(f, ops, gen)
+}
+
+func variant(f File, ops string, gen int) (body []byte, etag, mime string) {
+	key := fmt.Sprintf("%s|%s|%d", f.UUID, ops, gen)
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(key))
+	mime = f.MIME
+	if i := strings.LastIndex(ops, "/format/"); i >= 0 {
+		mime = "image/" + strings.SplitN(ops[i+len("/format/"):], "/", 2)[0]
+	}
+	return Content(key, f.Size/2+int64(len(ops))), fmt.Sprintf(`W/"%016x"`, h.Sum64()), mime
+}
+
+// ChangeVariants makes the CDN render every variant anew, as an engine
+// update would.
+func (s *Server) ChangeVariants() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.variantsGen++
 }
 
 // SetLatency delays every CDN response for one file.
@@ -107,6 +146,13 @@ func (s *Server) CDNStats() (requests int, bytes int64) {
 	return s.cdnReqs, s.cdnBytes
 }
 
+// CDNMethods splits the CDN requests served into HEADs and GETs.
+func (s *Server) CDNMethods() (heads, gets int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cdnHeads, s.cdnReqs - s.cdnHeads
+}
+
 func (s *Server) find(uuid string) (File, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -129,22 +175,39 @@ func (s *Server) fileInfo(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveCDN(w http.ResponseWriter, r *http.Request) {
-	uuid := r.PathValue("uuid")
+	uuid, ops := r.PathValue("uuid"), r.PathValue("ops")
 	f, ok := s.find(uuid)
 	s.mu.Lock()
 	s.cdnReqs++
+	if r.Method == http.MethodHead {
+		s.cdnHeads++
+	}
 	delay := s.latency[uuid]
+	gen := s.variantsGen
 	s.mu.Unlock()
 	time.Sleep(delay)
-	if !ok || f.Removed {
-		http.NotFound(w, r)
-		return
-	}
 	cw := &countingWriter{ResponseWriter: w}
-	http.ServeContent(cw, r, "", f.Uploaded, bytes.NewReader(Content(uuid, f.Size)))
-	s.mu.Lock()
-	s.cdnBytes += cw.n
-	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.cdnBytes += cw.n
+		s.mu.Unlock()
+	}()
+	switch {
+	case !ok || f.Removed:
+		http.NotFound(cw, r)
+	case slices.Contains(strings.Split(ops, "/"), BadArg):
+		cw.Header().Set("Content-Type", "text/html; charset=UTF-8")
+		cw.WriteHeader(http.StatusBadRequest)
+		_, _ = fmt.Fprintf(cw, "<html><head><title>400: Bad Request</title></head><body><h3>Bad Request</h3>\n"+
+			"<p>Cannot parse url part: %s</p>\n<p>See <a href=\"https://uploadcare.com/docs/\">CDN documentation</a>.</p></body></html>", BadArg)
+	case ops == "":
+		http.ServeContent(cw, r, "", f.Uploaded, bytes.NewReader(Content(uuid, f.Size)))
+	default:
+		body, etag, mime := variant(f, ops, gen)
+		cw.Header().Set("ETag", etag)
+		cw.Header().Set("Content-Type", mime)
+		http.ServeContent(cw, r, "", time.Time{}, bytes.NewReader(body))
+	}
 }
 
 type countingWriter struct {

@@ -257,3 +257,30 @@ func TestSmallSequentialReadsInOneBlockDoNotPrefetch(t *testing.T) {
 		t.Errorf("after crossing into block 1: %+v, want one block prefetched", st)
 	}
 }
+
+func TestVersionsAreSeparateAndDropRemovesBlocks(t *testing.T) {
+	f := &fakeFetcher{data: map[string][]byte{"a": pattern(2*BlockSize, 10)}}
+	c := newCache(t, f, 1<<30)
+	ctx := context.Background()
+	v1 := Key{UUID: "a", Ops: "-/resize/10x/", Version: `W/"1"`}
+	v2 := Key{UUID: "a", Ops: "-/resize/10x/", Version: `W/"2"`}
+	p := make([]byte, 10)
+	for _, k := range []Key{v1, v1, v2, {UUID: "a"}} {
+		if _, err := c.ReadAt(ctx, k, 2*BlockSize, p, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := f.calls.Load(); got != 3 {
+		t.Errorf("fetches = %d, want one per version and one for the original", got)
+	}
+	c.Drop(v1)
+	if st := c.Stats(); st.Used != 2*BlockSize {
+		t.Errorf("used after drop = %d, want the two other blocks", st.Used)
+	}
+	if _, err := c.ReadAt(ctx, v2, 2*BlockSize, p, 0); err != nil || f.calls.Load() != 3 {
+		t.Errorf("version 2 refetched after dropping version 1: %v", err)
+	}
+	if _, err := c.ReadAt(ctx, v1, 2*BlockSize, p, 0); err != nil || f.calls.Load() != 4 {
+		t.Errorf("dropped version not refetched: %v, calls %d", err, f.calls.Load())
+	}
+}

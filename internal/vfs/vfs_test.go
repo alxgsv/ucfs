@@ -181,7 +181,7 @@ func TestCDNNotFoundCallsMissing(t *testing.T) {
 	env := vfstest.New(t, f)
 	env.Fake.Remove(f.UUID)
 	missing := make(chan string, 1)
-	fs := vfs.New(env.Index, env.Cache, func(u string) { missing <- u })
+	fs := vfs.New(env.Index, env.Cache, env.CDN, func(u string) { missing <- u })
 	_, err := fs.ReadAt(context.Background(), vfs.Node{Kind: vfs.KindFile, UUID: f.UUID}, make([]byte, 10), 0)
 	if !errors.Is(err, syscall.ENOENT) {
 		t.Fatalf("err = %v, want ENOENT", err)

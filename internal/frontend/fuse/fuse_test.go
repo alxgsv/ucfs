@@ -106,3 +106,29 @@ func TestMountListReadAndReject(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestVariants(t *testing.T) {
+	env := vfstest.New(t, fake.File{UUID: uuid(1), Name: "hero.jpg", Size: 3<<20 + 11, MIME: "image/jpeg", Uploaded: t0})
+	dir := mount(t, env)
+	vdir := filepath.Join(dir, "files", uuid(1), "-", "resize", "1200x", "-", "format", "webp")
+
+	entries, err := os.ReadDir(vdir)
+	if err != nil || len(entries) != 1 || entries[0].Name() != "hero.webp" {
+		t.Fatalf("readdir = %v, %v; want the one default entry", entries, err)
+	}
+	body, _, _ := env.Fake.Variant(uuid(1), "-/resize/1200x/-/format/webp/")
+	got, err := os.ReadFile(filepath.Join(vdir, "hero.webp"))
+	if err != nil || !bytes.Equal(got, body) {
+		t.Errorf("read %d bytes, %v; content mismatch", len(got), err)
+	}
+	if heads, _ := env.Fake.CDNMethods(); heads != 1 {
+		t.Errorf("%d HEADs for listing and reading one variant", heads)
+	}
+	bad := filepath.Join(dir, "files", uuid(1), "-", "resize", fake.BadArg, "hero.jpg")
+	if _, err := os.Stat(bad); !errors.Is(err, syscall.EINVAL) {
+		t.Errorf("stat of a variant the CDN rejects: %v, want EINVAL", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "files", uuid(1), "-", "nosuchop")); !errors.Is(err, syscall.ENOENT) {
+		t.Errorf("stat of an unknown operation: %v, want ENOENT", err)
+	}
+}

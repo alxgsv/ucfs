@@ -93,13 +93,17 @@ func (n *node) Readdir(ctx context.Context) (gofs.DirStream, syscall.Errno) {
 	return gofs.NewListDirStream(out), 0
 }
 
-// Open keeps the page cache across opens: file content never changes.
+// Open keeps the page cache across opens of originals, whose content never
+// changes. A variant's content can change when its HEAD is renewed.
 func (n *node) Open(_ context.Context, flags uint32) (gofs.FileHandle, uint32, syscall.Errno) {
 	if n.n.IsDir() {
 		return nil, 0, syscall.EISDIR
 	}
 	if flags&syscall.O_ACCMODE != syscall.O_RDONLY {
 		return nil, 0, syscall.EROFS
+	}
+	if n.n.Kind == vfs.KindVariant {
+		return nil, 0, 0
 	}
 	return nil, gofuse.FOPEN_KEEP_CACHE, 0
 }

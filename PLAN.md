@@ -24,7 +24,7 @@ Decisions fixed up front:
 |---|---|---|
 | Language, toolchain | Go 1.26, `CGO_ENABLED=0` | Matches `uploadcare-go` and `uploadcare-cli`; static binaries; cross-compile for darwin/linux from one machine |
 | Repository and module path | `github.com/alxgsv/ucfs`, private for now, checkout `~/workspace/ucfs` | Personal repo while experimental; the module path equals the repo path, so going public needs no rename. A later move to the `uploadcare` org is a module-path change in `go.mod` and imports, nothing structural |
-| macOS front-end | Loopback NFSv3 server (`github.com/willscott/go-nfs`, pinned to master `c092ae79c64e` for `Server.ConcurrentHandlers`, which v0.0.4 lacks) mounted with the built-in `mount_nfs` as the user, no `sudo` (Spike A) | Zero install, no kext, works on managed Macs. Proven by rclone `nfsmount` |
+| macOS front-end | Loopback NFSv3 server (`github.com/willscott/go-nfs` at master `c092ae79c64e` for `Server.ConcurrentHandlers`, which v0.0.4 lacks; carried in `third_party/go-nfs` since Phase 2 with a patch that passes errnos through as NFS statuses) mounted with the built-in `mount_nfs` as the user, no `sudo` (Spike A) | Zero install, no kext, works on managed Macs. Proven by rclone `nfsmount` |
 | Linux front-end | FUSE via `github.com/hanwen/go-fuse/v2` (pure Go) | No libfuse dependency, full semantics (close, xattrs, invalidation). NFS front-end also builds on Linux as a fallback |
 | Index | SQLite via `modernc.org/sqlite` | Pure Go; WAL gives concurrent readers; survives restarts |
 | API client | `github.com/uploadcare/uploadcare-go/v2` (`file`, `upload`, `metadata`, `tag`, `group`, `project`) with `RetryConfig` enabled | Already covers list, search, info, store/delete, local copy, base and multipart upload, metadata, tags, groups |
@@ -43,11 +43,12 @@ internal/index/                SQLite schema and migrations, full scan, incremen
 internal/cache/                on-disk block cache, LRU eviction, singleflight, sequential detector, adaptive prefetch, traffic accounting
 internal/spool/                write spool, commit (upload), overwrite policy, alias table, upload journal
 internal/vfs/                  platform-neutral filesystem model: node ids, attrs, lookup/readdir/open/read/write/flush, xattrs, local-only shadow files
-internal/vfs/views/            files, variants, tree, bydate, tags, groups (one file each)
+internal/vfs/views/            files, variants, tree, bydate, tags, groups (one file each; files and variants are vfs.go and variants.go in internal/vfs so far)
 internal/frontend/nfs/         go-nfs Handler (stable file handles), billy.Filesystem adapter, mount_nfs/umount driver (darwin, linux)
 internal/frontend/fuse/        go-fuse adapter (linux build tag)
 internal/ctl/                  unix-socket control API used by `ucfs status`
 internal/fake/                 httptest doubles for REST, Upload API and CDN used by tests
+third_party/go-nfs/            go-nfs at the pinned commit with the errno patch (README.ucfs.md), wired in by a go.mod replace
 testdata/                      golden files, fixtures
 docs/                          mount options, troubleshooting, Finder notes
 Makefile  .goreleaser.yaml  .github/workflows/ci.yml  CLAUDE.md  AGENTS.md
@@ -76,7 +77,7 @@ The answers are in [docs/spikes.md](docs/spikes.md); the items below already ref
 One view end to end through both front-ends.
 
 9. `internal/vfs/`: node model (`NodeID` = 64-bit hash of view + uuid + ops/path), attrs from the index, `Lookup`, `ReadDir` (a full listing from the index; the NFS adapter pages it with go-nfs's verifier cache, so no cursor is needed), `Open`/`ReadAt`/`Release`, per-node attribute TTL hints (long for immutable entries, short for directories). `Lookup` matches names under Unicode NFC: the server keeps NFC and NFD names distinct, and with the `nfc` mount option macOS sends NFC in LOOKUP even for a name it listed as NFD (Spike D).
-10. `views/files`: `files/<uuid>_<original_filename>`; `files/<uuid>/` resolvable but not listed (reserved for Phase 2 variants). Server names can contain `/` (multipart keeps it, Spike D), so the view maps `/`, and NUL defensively, to safe characters.
+10. `views/files`: `files/<uuid>_<original_filename>`; `files/<uuid>/` resolvable but not listed (it holds the Phase 2 variants view). Server names can contain `/` (multipart keeps it, Spike D), so the view maps `/`, and NUL defensively, to safe characters.
 11. `internal/cdn/`: CDN base from public key (same derivation as the CLI), `HEAD`, ranged `GET`, ETag capture.
 12. `internal/cache/`: 1 MiB blocks on disk, size-bounded LRU, singleflight per (uuid, ops, block), sequential detector with prefetch window 1 → 16 MiB, per-mount byte counters. NFS has no open handle (go-nfs re-opens the file for every READ), so the detector is keyed per file and tracks several streams, so two readers of one file do not reset each other's window. Prefetch fetches the blocks ahead concurrently: with `readahead=0` the client sends one READ at a time per reader (Spike A). The window grows per block a reader moves into, not per read call, because Linux splits reads into 128 KiB FUSE requests (docs/phase1.md).
 13. `internal/frontend/nfs/`: `nfs.Handler` with stable, self-describing file handles (version, kind, uuid, ops/path hash) instead of the path-LRU helper; billy adapter over `vfs`; `ConcurrentHandlers` 128; mount/unmount driver using the Spike A option string (§4.6). go-nfs calls `Lstat` on almost every RPC and `Open`+`Stat` on every READ, so both must be index-only. `HandleLimit` must be large because READDIR caps a reply at `HandleLimit()/2` entries, and the handler implements go-nfs's verifier cache so a large directory is not re-listed for every READDIR page.
@@ -92,16 +93,41 @@ macOS and Linux.
 
 ### Phase 2: Variants as paths (≈ 2 days)
 
-17. `internal/cdn/ops.go`: static table of URL API operation names (from the URL API docs and the CLI's embedded
-    `url-api` reference); unknown operation → `ENOENT`.
-18. `views/variants`: `files/<uuid>/-/<op>/<args>/…/<name>`; operation components are directories; `readdir` on one
-    lists a single default entry named after the original file (extension adjusted for `format`); the leaf is a file
-    whose size comes from one `HEAD`, cached in the `variants` table.
-19. Reads via the same block cache keyed by (uuid, ops); variant blocks carry a TTL because their ETag is weak.
-20. CDN 400 on a variant maps to `EINVAL` on open, with the CDN message in the log.
+17. `internal/cdn/ops.go`: static table of the 40 URL API operation names, the union of the operation tables in the
+    URL API spec (plus `json`, a path there) and the CLI's `url-api` reference, with the two commands that regenerate
+    it. An unknown name after `-/` is `ENOENT` without a CDN request; arguments are not checked, the CDN judges them.
+    `OutputExt` gives the output's extension: the last `format/<x>` (`jpeg` → `jpg`, `auto` and `preserve` keep the
+    original's), `json` and `main_colors` → `json`.
+18. Variants view (`internal/vfs/variants.go`): `files/<uuid>/-/<op>/<args>/…/<name>`. `files/<uuid>/` stays out of
+    `files/` and lists the original under its own name plus `-`; `-/`, and every `…/-/`, lists nothing and resolves
+    only names from the table, so walking a file's directory costs no request. Operation and argument components are
+    directories. In one, `-` starts the next operation, the default entry is the variant, a name starting with `.` is
+    `ENOENT` (so `.DS_Store` and `._*` probes do not become directories), and any other name is one more argument.
+    The default entry is the original's name, mapped like `files/` (`""`, `.`, `..` and `-` become `unnamed`), with
+    the extension from `OutputExt`. Its size comes from one `HEAD`, shared by concurrent lookups and kept in the
+    `variants` table; `readdir` of an operation or argument directory reports the real size (macOS caches
+    READDIRPLUS attributes), so a listing costs the same one `HEAD` as a `stat`.
+19. Reads go through the block cache keyed by (uuid, ops), with the variant's ETag in the block object name. A HEAD
+    answer is trusted for 24 h; then the next access sends a new `HEAD`, keeps the blocks when size and ETag are
+    unchanged, and otherwise drops them and moves the variant's mtime, so NFS clients drop cached pages. FUSE keeps the
+    page cache across opens for originals only.
+20. A CDN 400 is `EINVAL` on lookup, `stat`, `readdir` and read; the reason is the `<p>` text of the CDN's HTML page,
+    fetched with one `GET` (a HEAD answer has no body) and logged at info, and the 400 is remembered for an hour,
+    the CDN's own `max-age` for it. A 404 goes to the Phase 1 REST refresh and is remembered for 10 s. go-nfs answered
+    every failed LOOKUP with `NOENT` and every failed READ with `IO` or `ACCES`, so `third_party/go-nfs` maps the errno
+    inside an error to the NFS status, and macOS reports "Invalid argument". `ucfs status` splits CDN requests into
+    HEADs and GETs.
 
 Acceptance: `cp files/<uuid>/-/resize/1200x/-/format/webp/hero.webp .` produces the same bytes as `curl` of the URL;
 `stat` on a never-seen variant costs exactly one `HEAD`; a second `stat` costs nothing.
+Measured in [docs/phase2.md](docs/phase2.md) on macOS and Linux: same MD5 as `curl`; one `HEAD` and no `GET` for the
+first `stat`, nothing for the second; an unknown operation is `ENOENT` and a bad argument `EINVAL`; three variants of one
+file read at once share the bandwidth without stalling, with `stat` of another file at 4–22 ms; `cp` of the 1200 px WebP
+cost 153,608 B against 9,785,662 B for the original.
+
+Also built in Phase 2: a registry of running mounts in `<user cache dir>/ucfs/mounts/` (canonical mount dir → control
+socket, pruned when the socket refuses connections), so `ucfs status` without arguments and `ucfs umount <dir>` find a
+mount whatever `--cache-dir` it was started with.
 
 ### Phase 3: Writes (≈ 5 days)
 
@@ -146,7 +172,9 @@ exactly the search result for `tags.all=[approved]`.
 
 33. Traffic budget `--traffic-budget` (bytes per day); reads beyond it fail with `EDQUOT` and `ucfs status` says so.
 34. Error → errno table applied everywhere: 404 `ENOENT`, 401/403 `EACCES`, 429 after retries `EAGAIN`, 5xx/network
-    `EIO`, unsupported `EOPNOTSUPP`/`EROFS`, bad variant `EINVAL`.
+    `EIO`, unsupported `EOPNOTSUPP`/`EROFS`, bad variant `EINVAL` (done in Phase 2; NFS carries errnos through the
+    patched go-nfs, and NFSv3 has no status for `EAGAIN`, so 429 needs `NFS3ERR_JUKEBOX` there). Check the ETag of every
+    variant 206 against the recorded one and fail the read on a mismatch (§4.4).
 35. Backpressure: bounded in-flight CDN requests per mount (default 32) with a fair queue, so a bulk `rsync` cannot
     starve interactive `stat`/`readdir`.
 36. Security defaults: `nosuid,nodev`, no `allow_other`, config file permission check, secrets never logged, cache dir
@@ -177,7 +205,9 @@ files     (uuid TEXT PRIMARY KEY, name TEXT, size INTEGER, mime TEXT, is_image I
            md5 TEXT, width INTEGER, height INTEGER, metadata TEXT /*json*/, tags TEXT /*json*/,
            tree_path TEXT, info_refreshed_at INTEGER);
            -- indexes: uploaded_at, name, tree_path, removed
-variants  (uuid TEXT, ops TEXT, size INTEGER, mime TEXT, etag TEXT, checked_at INTEGER, PRIMARY KEY (uuid, ops));
+variants  (uuid TEXT, ops TEXT, size INTEGER, mime TEXT, etag TEXT, checked_at INTEGER, changed_at INTEGER,
+           PRIMARY KEY (uuid, ops));                -- changed_at: first HEAD with this size and ETag (Phase 2)
+node_ops  (id INTEGER PRIMARY KEY, uuid TEXT, ops TEXT);  -- operations path behind a variants view node id (Phase 2)
 groups    (uuid TEXT PRIMARY KEY, created_at INTEGER, files TEXT /*json array of uuids*/);
 aliases   (view TEXT, name TEXT, uuid TEXT, expires_at INTEGER, PRIMARY KEY (view, name));
 tree_dirs (path TEXT PRIMARY KEY, created_at INTEGER);
@@ -204,12 +234,19 @@ chance at 1 M files). NFS file handles are self-describing (`version:1 byte, kin
 uuid:16 bytes, hash:8 bytes`), so a restarted daemon serves old handles without a path cache and never returns
 `ESTALE` for files that still exist. Handles must be a multiple of 4 bytes long: go-nfs reads them with
 `xdr.ReadOpaque`, which skips no XDR padding, and a 26-byte handle made every ACCESS reply deny everything.
+A variants view node (`-`, an operation, an argument, the variant) hashes its operations path, such as
+`-/resize/1200x/`, which does not fit in the handle. The first handle handed out for such a node records
+`(id, uuid, ops)` in `node_ops` (`INSERT OR IGNORE` behind an in-memory set), and decoding looks the path up by id,
+so these handles also survive a restart; an id never handed out is `ESTALE`.
 
 ### 4.4 Read path
 
-Open → sequential detector per object (streams per reader) → block cache (`<cache>/blocks/<uuid-or-hash>/<blockno>`) → singleflight →
-ranged `GET`. Prefetch window starts at 1 MiB and doubles while reads stay sequential, up to 16 MiB, bounded by the
-traffic budget. Originals never revalidate; variants expire after 24 h.
+Open → sequential detector per object (streams per reader) → block cache (`<cache>/blocks/<uuid>/<blockno>` for
+originals, `<cache>/blocks/<uuid>~<hash(ops, etag)>/<blockno>` for variants) → singleflight → ranged `GET`. Prefetch
+window starts at 1 MiB and doubles while reads stay sequential, up to 16 MiB, bounded by the traffic budget. Originals
+never revalidate. A variant's HEAD answer expires after 24 h; the next access sends a new `HEAD`, and a changed size or
+ETag drops the old blocks. A variant the CDN re-renders with other bytes inside those 24 h could mix blocks of both
+renderings; comparing the ETag of every 206 with the recorded one would catch it (Phase 5, item 34).
 
 ### 4.5 Write path
 
@@ -249,7 +286,7 @@ resolve to `::1`. `nobrowse` keeps the mount out of the Finder sidebar; `rdonly`
 | Finder/Spotlight traffic | 0 (Spike C), 3, 5. Spotlight is off on NFS mounts by default; a Finder window read every visible test image in full on first visit (JPEGs without an embedded thumbnail, also with `readahead=0`; Quick Look caches thumbnails across mounts, docs/phase1.md), and `.ql_disablethumbnails` does not stop it | `nobrowse`, `rdonly`, `readahead=0`, shadow files, traffic counter and budget |
 | NFS has no close event | 3 | idle commit; FUSE-T front-end in V1.1 for strict semantics |
 | No xattrs over NFSv3 on macOS | 4 | `ucfs resolve` and the CLI cover metadata on macOS until V1.1 |
-| go-nfs maturity ("minimally tested") | 1, 5 (soak) | fork and fix; rclone uses the same library in production |
+| go-nfs maturity ("minimally tested") | 1, 2, 5 (soak) | fork and fix, taken in Phase 2: `third_party/go-nfs` passes errnos through (LOOKUP could only fail with `NOENT`); offer the patch upstream. rclone uses the same library in production |
 | Stale index after foreign writes | 1, 4 | 30 s sync, lazy refresh, `ucfs index refresh` |
 
 ## 7. Strategic notes

@@ -5,9 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -15,11 +17,19 @@ import (
 
 var ErrNotFound = errors.New("not found on CDN")
 
+// BadRequestError is a CDN 400: the operations do not apply to the file, or
+// an argument is wrong. Message is the CDN's explanation.
+type BadRequestError struct {
+	URL     string
+	Message string
+}
+
+func (e *BadRequestError) Error() string { return "cdn " + e.URL + ": 400 " + e.Message }
+
 type Client struct {
-	base     string
-	hc       *http.Client
-	requests atomic.Int64
-	bytes    atomic.Int64
+	base               string
+	hc                 *http.Client
+	heads, gets, bytes atomic.Int64
 }
 
 // New returns a client for the CDN base URL. A nil transport means a clone of
@@ -34,9 +44,11 @@ func New(base string, rt http.RoundTripper) *Client {
 	return &Client{base: strings.TrimSuffix(base, "/"), hc: &http.Client{Transport: rt}}
 }
 
-// URL is the CDN URL of an original (ops empty) or of a variant.
+// URL is the CDN URL of an original (ops empty) or of a variant, ops being a
+// path such as "-/resize/1200x/-/format/webp/". Arguments come from path
+// components, so they are escaped; "," and ":" stay as the URL API writes them.
 func (c *Client) URL(uuid, ops string) string {
-	return c.base + "/" + uuid + "/" + ops
+	return c.base + (&url.URL{Path: "/" + uuid + "/" + ops}).EscapedPath()
 }
 
 type Info struct {
@@ -51,10 +63,28 @@ func (c *Client) Head(ctx context.Context, uuid, ops string) (Info, error) {
 		return Info{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if err := statusErr(resp, http.StatusOK); err != nil {
+	if resp.StatusCode == http.StatusBadRequest {
+		// A HEAD answer has no body, and the body holds the reason.
+		return Info{}, c.badRequest(ctx, uuid, ops)
+	}
+	if err := c.statusErr(resp, http.StatusOK); err != nil {
 		return Info{}, err
 	}
+	if resp.ContentLength < 0 {
+		return Info{}, fmt.Errorf("cdn HEAD %s: no Content-Length", c.URL(uuid, ops))
+	}
 	return Info{Size: resp.ContentLength, ETag: resp.Header.Get("ETag"), MIME: resp.Header.Get("Content-Type")}, nil
+}
+
+func (c *Client) badRequest(ctx context.Context, uuid, ops string) error {
+	bad := &BadRequestError{URL: c.URL(uuid, ops)}
+	resp, err := c.do(ctx, http.MethodGet, uuid, ops, "")
+	if err != nil {
+		return bad
+	}
+	defer func() { _ = resp.Body.Close() }()
+	errors.As(c.statusErr(resp, http.StatusOK), &bad)
+	return bad
 }
 
 // ReadRange fills p with the bytes at off. The caller sizes p to end at or
@@ -82,7 +112,7 @@ func (c *Client) ReadRange(ctx context.Context, uuid, ops string, p []byte, off 
 	case http.StatusRequestedRangeNotSatisfiable:
 		return 0, io.EOF
 	default:
-		return 0, statusErr(resp, http.StatusPartialContent)
+		return 0, c.statusErr(resp, http.StatusPartialContent)
 	}
 	n, err := io.ReadFull(resp.Body, p)
 	c.bytes.Add(int64(n))
@@ -99,19 +129,58 @@ func (c *Client) do(ctx context.Context, method, uuid, ops, rng string) (*http.R
 	if rng != "" {
 		req.Header.Set("Range", rng)
 	}
-	c.requests.Add(1)
+	if method == http.MethodHead {
+		c.heads.Add(1)
+	} else {
+		c.gets.Add(1)
+	}
 	return c.hc.Do(req)
 }
 
-func statusErr(resp *http.Response, want int) error {
+// maxErrorBody bounds what is read of an error page; the CDN's are about 1 KiB.
+const maxErrorBody = 64 << 10
+
+func (c *Client) statusErr(resp *http.Response, want int) error {
 	switch resp.StatusCode {
 	case want:
 		return nil
 	case http.StatusNotFound:
 		return ErrNotFound
+	case http.StatusBadRequest:
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
+		c.bytes.Add(int64(len(body)))
+		return &BadRequestError{URL: resp.Request.URL.String(), Message: errorMessage(body)}
 	default:
 		return fmt.Errorf("cdn %s %s: %s", resp.Request.Method, resp.Request.URL, resp.Status)
 	}
+}
+
+// errorMessage is the text of the CDN's HTML error page without the title
+// and the trailing link to the documentation.
+func errorMessage(page []byte) string {
+	s := string(page)
+	if i := strings.Index(s, "<body"); i >= 0 {
+		s = s[i:]
+	}
+	var b strings.Builder
+	inTag := false
+	for _, r := range s {
+		switch {
+		case r == '<':
+			inTag = true
+			b.WriteByte(' ')
+		case r == '>':
+			inTag = false
+		case !inTag:
+			b.WriteRune(r)
+		}
+	}
+	text := strings.Join(strings.Fields(html.UnescapeString(b.String())), " ")
+	text = strings.TrimPrefix(text, "Bad Request ")
+	if i := strings.LastIndex(text, " See "); i >= 0 {
+		text = text[:i]
+	}
+	return text
 }
 
 // rangeStart parses the first byte position of "bytes a-b/size".
@@ -129,10 +198,13 @@ func rangeStart(h string) (int64, bool) {
 }
 
 type Stats struct {
-	Requests int64
-	Bytes    int64
+	Requests    int64
+	Heads, Gets int64
+	// Bytes counts response bodies read: content and error pages.
+	Bytes int64
 }
 
 func (c *Client) Stats() Stats {
-	return Stats{Requests: c.requests.Load(), Bytes: c.bytes.Load()}
+	h, g := c.heads.Load(), c.gets.Load()
+	return Stats{Requests: h + g, Heads: h, Gets: g, Bytes: c.bytes.Load()}
 }
