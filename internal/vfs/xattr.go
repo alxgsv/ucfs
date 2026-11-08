@@ -354,12 +354,20 @@ func checkFlags(flags int, exists bool) error {
 	return nil
 }
 
+// copyTarget reports whether a target is a file that a copy may still be
+// setting attributes on: one not uploaded yet, or one this mount uploaded
+// within the last minute, since rsync closes its temporary file, which
+// uploads it, before it sets the attributes. Read-only attributes set on
+// such a file are ignored rather than refused, as its upload decides them,
+// so cp --preserve=xattr and rsync -X of files from the mount succeed.
+func (f *FS) copyTarget(t xattrTarget) bool {
+	return t.spool != nil || (t.uuid != "" && t.ops == "" && f.w.Spools.Recent(t.uuid))
+}
+
 // Setxattr sets user.uc.meta.<key> with one metadata PUT, or user.uc.tags
 // with one tags PUT, and records the result in the index. On a file not
 // uploaded yet the value goes into its upload form instead. Other user.uc.*
-// attributes are read-only; on a file not uploaded yet they are ignored,
-// as its upload decides them, so that cp --preserve=xattr and rsync -X of
-// a file from the mount do not fail on them.
+// attributes are read-only.
 func (f *FS) Setxattr(ctx context.Context, n Node, name string, value []byte, flags int) error {
 	if f.w == nil {
 		return syscall.EROFS
@@ -383,7 +391,7 @@ func (f *FS) Setxattr(ctx context.Context, n Node, name string, value []byte, fl
 	}
 	t, ok, err := f.target(ctx, n)
 	switch {
-	case errors.Is(check, syscall.EPERM) && err == nil && t.spool != nil:
+	case errors.Is(check, syscall.EPERM) && err == nil && ok && f.copyTarget(t):
 		return nil
 	case check != nil:
 		return check
@@ -455,16 +463,13 @@ func (f *FS) Removexattr(ctx context.Context, n Node, name string) error {
 	}
 	f.stats.removes.Add(1)
 	key, isMeta := strings.CutPrefix(name, XattrMeta)
-	switch {
-	case isMeta:
-		if key == index.TreePathKey {
-			return syscall.EPERM
-		}
-	case name != XattrTags:
-		return syscall.EPERM
-	}
+	readOnly := (isMeta && key == index.TreePathKey) || (!isMeta && name != XattrTags)
 	t, ok, err := f.target(ctx, n)
 	switch {
+	case readOnly && err == nil && ok && f.copyTarget(t):
+		return nil
+	case readOnly:
+		return syscall.EPERM
 	case err != nil:
 		return err
 	case !ok:

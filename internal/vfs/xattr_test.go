@@ -178,8 +178,10 @@ func TestMetadataXattrs(t *testing.T) {
 			t.Errorf("setxattr %.40s = %v, want %v", tt.name, err, tt.want)
 		}
 	}
-	if err := env.FS.Removexattr(ctx, n, vfs.XattrMeta+"ucfs:path"); !errors.Is(err, syscall.EPERM) {
-		t.Errorf("removing ucfs:path = %v, want EPERM", err)
+	for _, name := range []string{vfs.XattrMeta + "ucfs:path", vfs.XattrUUID} {
+		if err := env.FS.Removexattr(ctx, n, name); !errors.Is(err, syscall.EPERM) {
+			t.Errorf("removing %s = %v, want EPERM", name, err)
+		}
 	}
 
 	// The 50-key limit comes from the API, whose answer is ENOSPC.
@@ -363,6 +365,15 @@ func TestPendingXattrs(t *testing.T) {
 	}
 	if got, _ := getx(t, env, "tree/new.jpg", vfs.XattrMeta+"camera"); got != "Canon" {
 		t.Errorf("after the upload camera = %q", got)
+	}
+	// rsync -X sets attributes after closing, so after the upload; for a
+	// minute the read-only ones are still ignored.
+	up := walk(t, env, "tree/new.jpg").Node
+	if err := env.FS.Setxattr(ctx, up, vfs.XattrUUID, []byte("copied"), 0); err != nil {
+		t.Errorf("setxattr uuid right after the upload = %v, want it ignored", err)
+	}
+	if err := env.FS.Removexattr(ctx, up, vfs.XattrMIME); err != nil {
+		t.Errorf("removexattr mime right after the upload = %v, want it ignored", err)
 	}
 	if got, _ := getx(t, env, "tree/new.jpg", vfs.XattrMD5); got != fmt.Sprintf("%x", md5.Sum([]byte("hello"))) {
 		t.Errorf("md5 of an upload = %q", got)
