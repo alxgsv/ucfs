@@ -270,6 +270,16 @@ var errnoStatus = map[syscall.Errno]NFSStatus{
 	syscall.ENOTEMPTY:    NFSStatusNotEmpty,
 	syscall.EDQUOT:       NFSStatusDQuot,
 	syscall.ESTALE:       NFSStatusStale,
+	syscall.EXDEV:        NFSStatusXDev,
+	// NFSv3 has no EAGAIN; JUKEBOX asks the client to retry later.
+	syscall.EAGAIN: NFSStatusJukebox,
+}
+
+// ENOTSUP and EOPNOTSUPP are one value on Linux and two on darwin, so they
+// cannot both be keys of the map literal.
+func init() {
+	errnoStatus[syscall.ENOTSUP] = NFSStatusNotSupp
+	errnoStatus[syscall.EOPNOTSUPP] = NFSStatusNotSupp
 }
 
 // statusFromError returns the status for the errno err carries, or fallback
@@ -282,4 +292,14 @@ func statusFromError(err error, fallback NFSStatus) NFSStatus {
 		}
 	}
 	return fallback
+}
+
+// asStatusError keeps a status the procedure already chose and maps any
+// other error by its errno.
+func asStatusError(err error, fallback NFSStatus) error {
+	var se *NFSStatusError
+	if errors.As(err, &se) {
+		return se
+	}
+	return &NFSStatusError{statusFromError(err, fallback), err}
 }

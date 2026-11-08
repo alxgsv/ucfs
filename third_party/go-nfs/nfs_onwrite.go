@@ -1,3 +1,7 @@
+// Modified for ucfs: WRITE replies UNSTABLE to a Committer and commits a stable
+// WRITE, and errors carrying an errno map to the matching NFS status (see
+// statusFromError). Upstream: github.com/willscott/go-nfs c092ae79c64e.
+
 package nfs
 
 import (
@@ -56,7 +60,7 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 		if os.IsNotExist(err) {
 			return &NFSStatusError{NFSStatusNoEnt, err}
 		}
-		return &NFSStatusError{NFSStatusAccess, err}
+		return &NFSStatusError{statusFromError(err, NFSStatusAccess), err}
 	}
 	if !info.Mode().IsRegular() {
 		return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
@@ -66,7 +70,7 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 	// now the actual op.
 	file, err := fs.OpenFile(fs.Join(path...), os.O_RDWR, info.Mode().Perm())
 	if err != nil {
-		return &NFSStatusError{NFSStatusAccess, err}
+		return &NFSStatusError{statusFromError(err, NFSStatusAccess), err}
 	}
 	if req.Offset > 0 {
 		if _, err := file.Seek(int64(req.Offset), io.SeekStart); err != nil {
@@ -80,11 +84,22 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 	writtenCount, err := file.Write(req.Data[:end])
 	if err != nil {
 		Log.Errorf("Error writing: %v", err)
-		return &NFSStatusError{statusFromWriteError(err), err}
+		return &NFSStatusError{statusFromError(err, statusFromWriteError(err)), err}
 	}
 	if err := file.Close(); err != nil {
 		Log.Errorf("error closing: %v", err)
-		return &NFSStatusError{statusFromWriteError(err), err}
+		return &NFSStatusError{statusFromError(err, statusFromWriteError(err)), err}
+	}
+	committed := fileSync
+	if c, ok := fs.(Committer); ok {
+		// A stable WRITE is a write and a commit at once: macOS sends a
+		// file that fits in one WRITE as a single FILE_SYNC WRITE and no
+		// COMMIT.
+		if req.How == uint32(unstable) {
+			committed = unstable
+		} else if err := c.Commit(fullPath); err != nil {
+			return &NFSStatusError{statusFromError(err, NFSStatusIO), err}
+		}
 	}
 
 	writer := bytes.NewBuffer([]byte{})
@@ -98,7 +113,7 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 	if err := xdr.Write(writer, uint32(writtenCount)); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
-	if err := xdr.Write(writer, fileSync); err != nil {
+	if err := xdr.Write(writer, committed); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
 	if err := xdr.Write(writer, w.Server.ID); err != nil {

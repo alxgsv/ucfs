@@ -1,5 +1,5 @@
-// Package fake provides httptest doubles of the Uploadcare REST API and CDN
-// for tests.
+// Package fake provides httptest doubles of the Uploadcare REST API, Upload
+// API and CDN for tests.
 package fake
 
 import (
@@ -23,6 +23,8 @@ import (
 const (
 	restHost   = "api.uploadcare.com"
 	uploadHost = "upload.uploadcare.com"
+	// partsHost stands for the storage hosts multipart parts go to.
+	partsHost = "parts.fake.invalid"
 	// fromLayout is what uploadcare-go sends; the API's own next links carry
 	// microseconds and a zone, which time.RFC3339Nano also parses.
 	fromLayout = "2006-01-02T15:04:05"
@@ -40,6 +42,10 @@ type File struct {
 	Width    int
 	Height   int
 	Metadata map[string]string
+	Tags     []string
+	// NotReady is a multipart upload started and not completed, which the
+	// API lists like a file.
+	NotReady bool
 }
 
 // Server is a fake Uploadcare project.
@@ -55,6 +61,7 @@ type Server struct {
 	cdnHeads    int
 	cdnBytes    int64
 	variantsGen int
+	up          uploads
 }
 
 func New(t testing.TB) *Server {
@@ -62,6 +69,13 @@ func New(t testing.TB) *Server {
 	rest := http.NewServeMux()
 	rest.HandleFunc("GET /files/", s.listFiles)
 	rest.HandleFunc("GET /files/{uuid}/", s.fileInfo)
+	rest.HandleFunc("DELETE /files/{uuid}/storage/", s.deleteStorage)
+	rest.HandleFunc("PUT /files/{uuid}/metadata/{key}/", s.putMetadata)
+	rest.HandleFunc("DELETE /files/{uuid}/metadata/{key}/", s.deleteMetadata)
+	rest.HandleFunc("POST /base/", s.baseUpload)
+	rest.HandleFunc("POST /multipart/start/", s.multipartStart)
+	rest.HandleFunc("PUT /part/{uuid}/{n}", s.putPart)
+	rest.HandleFunc("POST /multipart/complete/", s.multipartComplete)
 	mux := http.NewServeMux()
 	mux.Handle("/", s.count(rest))
 	mux.HandleFunc("GET /cdn/{uuid}/{ops...}", s.serveCDN)
@@ -201,7 +215,7 @@ func (s *Server) serveCDN(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprintf(cw, "<html><head><title>400: Bad Request</title></head><body><h3>Bad Request</h3>\n"+
 			"<p>Cannot parse url part: %s</p>\n<p>See <a href=\"https://uploadcare.com/docs/\">CDN documentation</a>.</p></body></html>", BadArg)
 	case ops == "":
-		http.ServeContent(cw, r, "", f.Uploaded, bytes.NewReader(Content(uuid, f.Size)))
+		http.ServeContent(cw, r, "", f.Uploaded, bytes.NewReader(s.content(f)))
 	default:
 		body, etag, mime := variant(f, ops, gen)
 		cw.Header().Set("ETag", etag)
@@ -249,7 +263,7 @@ func (s *Server) Transport() http.RoundTripper {
 	target, _ := url.Parse(s.URL)
 	return roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		switch req.URL.Host {
-		case restHost, uploadHost:
+		case restHost, uploadHost, partsHost:
 			req = req.Clone(req.Context())
 			req.URL.Scheme, req.URL.Host = target.Scheme, target.Host
 		}
@@ -362,13 +376,18 @@ func fileJSON(f File) json.RawMessage {
 	if meta == nil {
 		meta = map[string]string{}
 	}
+	tags := f.Tags
+	if tags == nil {
+		tags = []string{}
+	}
 	b, _ := json.Marshal(map[string]any{
+		"tags":              tags,
 		"uuid":              f.UUID,
 		"original_filename": f.Name,
 		"size":              f.Size,
 		"mime_type":         f.MIME,
 		"is_image":          f.Width > 0,
-		"is_ready":          true,
+		"is_ready":          !f.NotReady,
 		"datetime_uploaded": ts(f.Uploaded),
 		"datetime_stored":   stored,
 		"datetime_removed":  removed,

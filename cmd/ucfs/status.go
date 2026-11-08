@@ -117,6 +117,19 @@ func printStatus(w io.Writer, st ctl.Status) error {
 		st.CDN.Requests, st.CDN.Heads, st.CDN.Gets, b(st.CDN.Bytes), st.CDN.Bytes,
 		b(st.Cache.Served), b(st.Cache.Hit), b(st.Cache.FetchedDemand), b(st.Cache.FetchedPrefetch),
 		b(st.Cache.Used), b(st.Cache.Max))
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(w, "  api    %d REST, %d Upload API, %d part PUTs, %d throttled\n",
+		st.API.REST, st.API.Upload, st.API.Parts, st.API.Throttled)
+	if err != nil || !st.Writes.Enabled {
+		return err
+	}
+	wr := st.Writes
+	_, err = fmt.Fprintf(w, "  writes %d uploaded (%s), %d failed; spooled: %d writing, %d queued, %d uploading, %d failed; overwrite %s\n"+
+		"  local  %d shadow files created, %d writes, %s kept local\n",
+		wr.Uploads, b(wr.UploadBytes), wr.UploadFails, wr.Writing, wr.Queued, wr.Uploading, wr.Failed, wr.Overwrite,
+		wr.ShadowCreates, wr.ShadowWrites, b(wr.ShadowBytes))
 	return err
 }
 

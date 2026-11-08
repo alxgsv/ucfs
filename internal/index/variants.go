@@ -57,3 +57,37 @@ func (ix *Index) NodeOps(ctx context.Context, id uint64) (uuid, ops string, err 
 	}
 	return uuid, ops, err
 }
+
+// MoveNodePaths maps the ids recorded for a directory known by path, and for
+// those below it, to the directory's new path. Only rows without a uuid,
+// which tree and shadow directories leave, are paths.
+func (ix *Index) MoveNodePaths(ctx context.Context, from, to string) error {
+	lo, hi := from+"/", from+"0"
+	rows, err := ix.db.QueryContext(ctx, `SELECT id, ops FROM node_ops WHERE uuid = '' AND (ops = ? OR (ops >= ? AND ops < ?))`,
+		from, lo, hi)
+	if err != nil {
+		return err
+	}
+	type row struct {
+		id  int64
+		ops string
+	}
+	var todo []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.ops); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		todo = append(todo, r)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, r := range todo {
+		if _, err := ix.db.ExecContext(ctx, `UPDATE node_ops SET ops = ? WHERE id = ?`, to+r.ops[len(from):], r.id); err != nil {
+			return err
+		}
+	}
+	return nil
+}

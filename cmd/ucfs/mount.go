@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"github.com/alxgsv/ucfs/internal/ctl"
 	"github.com/alxgsv/ucfs/internal/frontend"
 	"github.com/alxgsv/ucfs/internal/index"
+	"github.com/alxgsv/ucfs/internal/spool"
 	"github.com/alxgsv/ucfs/internal/vfs"
 )
 
@@ -29,6 +31,7 @@ type mountFlags struct {
 	cacheSize     string
 	syncInterval  time.Duration
 	sweepInterval time.Duration
+	writeFlags
 }
 
 // mounted is a filesystem attached by one of the front-ends.
@@ -44,27 +47,30 @@ func newMountCmd(g *globalFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "mount <dir>",
 		Short: "Mount the project at dir and serve it until unmounted",
-		Long: "Mounts the project read-only and keeps running in the foreground until\n" +
-			"`ucfs umount <dir>`, an external umount, or Ctrl-C.",
+		Long: "Mounts the project and keeps running in the foreground until\n" +
+			"`ucfs umount <dir>`, an external umount, or Ctrl-C. Files written in tree/ or\n" +
+			"files/ are uploaded; see `ucfs resolve` for the uuid a write got.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error { return runMount(cmd.Context(), g, f, args[0]) },
 	}
 	fl := cmd.Flags()
 	fl.StringVar(&f.frontend, "frontend", defaultFrontend, "nfs or fuse (fuse is Linux only)")
-	fl.BoolVar(&f.readOnly, "read-only", true, "mount read-only (writes arrive in a later phase)")
+	fl.BoolVar(&f.readOnly, "read-only", false, "mount read-only; on macOS this also stops Finder writing .DS_Store files")
 	fl.IntVar(&f.readAhead, "readahead", 0, "macOS NFS client read-ahead in 1 MiB blocks; ucfs prefetches by itself")
 	fl.BoolVar(&f.browse, "browse", false, "show the mount in the Finder sidebar (macOS)")
 	fl.StringVar(&f.cacheSize, "cache-size", "2GiB", "on-disk block cache limit")
 	fl.DurationVar(&f.syncInterval, "sync-interval", 30*time.Second, "how often to list new uploads")
 	fl.DurationVar(&f.sweepInterval, "sweep-interval", 10*time.Minute, "how often to look for removed files")
+	f.register(fl)
 	return cmd
 }
 
 func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) error {
-	if !f.readOnly {
-		return errors.New("only read-only mounts are supported so far")
+	opts, err := f.options()
+	if err != nil {
+		return err
 	}
-	dir, err := filepath.Abs(dir)
+	dir, err = filepath.Abs(dir)
 	if err != nil {
 		return err
 	}
@@ -107,6 +113,32 @@ func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) er
 	loop := &index.Loop{Index: ix, Source: client, Interval: f.syncInterval, SweepEvery: f.sweepInterval}
 	fsys := vfs.New(ix, c, cd, func(uuid string) { loop.Refresh(context.WithoutCancel(ctx), uuid) })
 	loop.Changed = fsys.Touch
+	journal := &spool.Journal{Path: filepath.Join(cfg.CacheDir, "uploads.log")}
+	fsys.Journal(journal.Path)
+	var spools *spool.Manager
+	if !f.readOnly {
+		unlock, err := lockCache(cfg.CacheDir)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+		opts.Dir = filepath.Join(cfg.CacheDir, "spool")
+		if spools, err = spool.Open(ctx, ix, client, journal, opts); err != nil {
+			return err
+		}
+		defer spools.Shutdown(2 * time.Minute)
+		spools.OnUploaded = func(uuid string, data io.ReaderAt, size int64) {
+			if err := c.Put(cache.Key{UUID: uuid}, data, size); err != nil {
+				slog.Warn("cache an upload", "uuid", uuid, "err", err)
+			}
+		}
+		shadowDir := filepath.Join(cfg.CacheDir, "shadow")
+		if err := os.MkdirAll(shadowDir, 0o700); err != nil {
+			return err
+		}
+		fsys.EnableWrites(&vfs.Writes{Spools: spools, API: client, ShadowDir: shadowDir,
+			Foreign: f.foreign, Keep: opts.Keep})
+	}
 	loopCtx, stopLoop := context.WithCancel(ctx)
 	defer stopLoop()
 	go loop.Run(loopCtx)
@@ -139,6 +171,15 @@ func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) er
 		ks := c.Stats()
 		st.Cache = ctl.CacheStatus{Served: ks.Served, Hit: ks.Hit, FetchedDemand: ks.FetchedDemand,
 			FetchedPrefetch: ks.FetchedPrefetch, Used: ks.Used, Max: ks.Max}
+		as := client.Stats()
+		st.API = ctl.APIStatus{REST: as.REST, Upload: as.Upload, Parts: as.Parts, Throttled: as.Throttled}
+		if spools != nil {
+			ss, ws := spools.Stats(), fsys.WriteStats()
+			st.Writes = ctl.WritesStatus{Enabled: true, Overwrite: f.overwrite,
+				Writing: ss.Writing, Queued: ss.Queued, Uploading: ss.Uploading, Failed: ss.Failed,
+				Uploads: ss.Uploads, UploadFails: ss.Failures, UploadBytes: ss.Bytes,
+				ShadowCreates: ws.ShadowCreates, ShadowWrites: ws.ShadowWrites, ShadowBytes: ws.ShadowBytes}
+		}
 		return st
 	}
 	sock := ctl.SocketPath(cfg.CacheDir, dir)
@@ -147,7 +188,7 @@ func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) er
 		case unmountReq <- struct{}{}:
 		default:
 		}
-	})
+	}, routes(fsys, spools, journal, cfg.CDNBase)...)
 	if err != nil {
 		return errors.Join(err, m.Unmount())
 	}
@@ -155,7 +196,10 @@ func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) er
 	defer register(dir, sock)()
 
 	is, _ := ix.Stats(ctx)
-	slog.Info("mounted", "dir", dir, "frontend", f.frontend, "project", name, "files", is.Files)
+	slog.Info("mounted", "dir", dir, "frontend", f.frontend, "project", name, "files", is.Files, "read_only", f.readOnly)
+	if spools != nil {
+		spools.Recover(ctx)
+	}
 	select {
 	case <-ctx.Done():
 		slog.Info("signal received, unmounting", "dir", dir)

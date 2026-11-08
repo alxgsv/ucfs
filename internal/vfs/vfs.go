@@ -1,6 +1,7 @@
 // Package vfs is the platform-neutral filesystem model that the NFS and FUSE
 // front-ends adapt. Every metadata operation is answered from the index;
-// only ReadAt reaches the CDN, through the block cache.
+// only ReadAt reaches the CDN, through the block cache. Writes go to spools
+// and become uploads (write.go).
 package vfs
 
 import (
@@ -38,18 +39,61 @@ const (
 	KindVariantDir
 	// KindVariant is the file in an operation or argument directory.
 	KindVariant
+	// KindTreeDir is tree/ or a directory below it, by path.
+	KindTreeDir
+	// KindInbox is tree/_inbox, the files without a tree path.
+	KindInbox
+	// KindTreeFile is a file in tree/ or tree/_inbox, or a name written in
+	// files/: an object, whose identity survives its upload, overwrites and
+	// renames (index.Object).
+	KindTreeFile
+	// KindShadow is a local-only file such as .DS_Store, also an object.
+	KindShadow
+	// KindShadowDir is a local-only directory such as .TemporaryItems.
+	KindShadowDir
+	// KindUcfsDir is .ucfs at the root; KindJournal is .ucfs/uploads.log.
+	KindUcfsDir
+	KindJournal
+	// KindNeverIndex is .metadata_never_index at the root, which keeps
+	// Spotlight away.
+	KindNeverIndex
 )
 
-// HasUUID reports whether nodes of this kind belong to one file.
-func (k Kind) HasUUID() bool { return k != KindRoot && k != KindFilesDir }
+// HasUUID reports whether NFS handles of this kind carry a uuid. A tree
+// file's is the key of its object, which may be empty.
+func (k Kind) HasUUID() bool {
+	switch k {
+	case KindFile, KindFileDir, KindVariantDir, KindVariant, KindTreeFile:
+		return true
+	}
+	return false
+}
+
+// ByPath reports whether nodes of this kind are known by their path, which
+// the index keeps by node id for NFS handles (FS.Remember).
+func (k Kind) ByPath() bool {
+	switch k {
+	case KindVariantDir, KindVariant, KindTreeDir, KindShadowDir:
+		return true
+	}
+	return false
+}
 
 type Node struct {
 	Kind Kind
+	// UUID is the file of a files/ or variants view node, and the key of a
+	// tree file's object.
 	UUID string
 	// Ops is the operations path of a variants view node in the form the CDN
 	// URL takes: "-/" for files/<uuid>/-, and "-/resize/1200x/" for that
-	// argument directory and for the variant inside it.
+	// argument directory and for the variant inside it. For a tree
+	// directory it is the tree path ("/" for tree/ itself, "/photos" below
+	// it), and for a shadow directory the path relative to the mount root.
 	Ops string
+	// Ino is an object's inode number: tree files and shadow files. A tree
+	// or shadow directory rebuilt from a handle handed out before it was
+	// renamed keeps the inode number the handle carries.
+	Ino uint64
 }
 
 // ID is the node's stable 64-bit identity, used as inode and NFS file id.
@@ -68,11 +112,37 @@ func (n Node) ID() uint64 {
 		_, _ = h.Write([]byte("files\x00" + n.UUID + "\x00" + n.Ops))
 	case KindVariant:
 		_, _ = h.Write([]byte("files\x00" + n.UUID + "\x00" + n.Ops + "\x00"))
+	case KindTreeFile, KindShadow:
+		return n.Ino
+	case KindTreeDir:
+		if n.Ino != 0 {
+			return n.Ino
+		}
+		_, _ = h.Write([]byte("tree\x00" + n.Ops))
+	case KindInbox:
+		_, _ = h.Write([]byte("tree\x00" + InboxDir))
+	case KindShadowDir:
+		if n.Ino != 0 {
+			return n.Ino
+		}
+		_, _ = h.Write([]byte("shadow\x00" + n.Ops))
+	case KindUcfsDir:
+		_, _ = h.Write([]byte(UcfsDir))
+	case KindJournal:
+		_, _ = h.Write([]byte(UcfsDir + "/" + JournalName))
+	case KindNeverIndex:
+		_, _ = h.Write([]byte(NeverIndex))
 	}
 	return h.Sum64()
 }
 
-func (n Node) IsDir() bool { return n.Kind != KindFile && n.Kind != KindVariant }
+func (n Node) IsDir() bool {
+	switch n.Kind {
+	case KindFile, KindVariant, KindTreeFile, KindShadow, KindJournal, KindNeverIndex:
+		return false
+	}
+	return true
+}
 
 // Attr carries attributes plus how long a kernel may cache them.
 type Attr struct {
@@ -89,7 +159,12 @@ type Entry struct {
 }
 
 const (
-	FilesDir = "files"
+	FilesDir    = "files"
+	TreeDir     = "tree"
+	InboxDir    = "_inbox"
+	UcfsDir     = ".ucfs"
+	JournalName = "uploads.log"
+	NeverIndex  = ".metadata_never_index"
 	// File content never changes, so attributes can be cached for long.
 	fileTTL = time.Hour
 	// Directory listings change with every sync.
@@ -106,6 +181,10 @@ type FS struct {
 	cache *cache.Cache
 	cdn   Header
 	now   func() time.Time
+	// w is nil on a read-only mount.
+	w       *Writes
+	wstats  writeStats
+	journal string
 	// dirMtime moves whenever the index changes, so NFS clients that compare
 	// directory mtimes re-read the listing.
 	dirMtime atomic.Int64
@@ -129,6 +208,9 @@ func New(ix *index.Index, c *cache.Cache, head Header, missing func(uuid string)
 	return f
 }
 
+// Journal sets the upload journal file shown as .ucfs/uploads.log.
+func (f *FS) Journal(p string) { f.journal = p }
+
 // Touch records that the index changed.
 func (f *FS) Touch() { f.dirMtime.Store(time.Now().UnixNano()) }
 
@@ -136,6 +218,15 @@ func (f *FS) Root() Node { return Node{Kind: KindRoot} }
 
 func (f *FS) dirAttr(ttl time.Duration) Attr {
 	return Attr{Mode: os.ModeDir | 0o555, Mtime: time.Unix(0, f.dirMtime.Load()), TTL: ttl}
+}
+
+// writableDirAttr is the attribute of a directory that takes new entries.
+func (f *FS) writableDirAttr(ttl time.Duration) Attr {
+	a := f.dirAttr(ttl)
+	if f.w != nil {
+		a.Mode |= 0o200
+	}
+	return a
 }
 
 func fileAttr(file index.File) Attr {
@@ -168,8 +259,38 @@ func (f *FS) Getattr(ctx context.Context, n Node) (Attr, error) {
 			return Attr{}, err
 		}
 		return f.variantAttr(v), nil
+	case KindTreeDir:
+		ok, err := f.ix.TreeDirExists(ctx, n.Ops)
+		switch {
+		case err != nil:
+			return Attr{}, f.ioErr("tree dir", err)
+		case !ok:
+			return Attr{}, syscall.ENOENT
+		}
+		return f.writableDirAttr(dirTTL), nil
+	case KindInbox:
+		return f.dirAttr(dirTTL), nil
+	case KindTreeFile:
+		o, err := f.occupant(ctx, n)
+		if err != nil {
+			return Attr{}, err
+		}
+		return f.occupantAttr(o), nil
+	case KindShadow, KindShadowDir:
+		return f.shadowAttr(ctx, n)
+	case KindUcfsDir:
+		return f.dirAttr(dirTTL), nil
+	case KindJournal:
+		return f.journalAttr(), nil
+	case KindNeverIndex:
+		return Attr{Mode: 0o444, Mtime: time.Unix(0, 0), TTL: fileTTL}, nil
 	}
 	return Attr{}, syscall.ENOENT
+}
+
+func (f *FS) ioErr(what string, err error) error {
+	slog.Error(what, "err", err)
+	return syscall.EIO
 }
 
 // file returns a present file or ENOENT.
@@ -188,14 +309,24 @@ func (f *FS) file(ctx context.Context, uuid string) (index.File, error) {
 func (f *FS) Lookup(ctx context.Context, dir Node, name string) (Entry, error) {
 	switch dir.Kind {
 	case KindRoot:
-		if name == FilesDir {
-			n := Node{Kind: KindFilesDir}
-			return Entry{Name: name, Node: n, Attr: f.dirAttr(dirTTL)}, nil
+		switch {
+		case name == FilesDir:
+			return Entry{Name: name, Node: Node{Kind: KindFilesDir}, Attr: f.writableDirAttr(dirTTL)}, nil
+		case name == TreeDir:
+			return Entry{Name: name, Node: Node{Kind: KindTreeDir, Ops: "/"}, Attr: f.writableDirAttr(dirTTL)}, nil
+		case name == UcfsDir:
+			return Entry{Name: name, Node: Node{Kind: KindUcfsDir}, Attr: f.dirAttr(dirTTL)}, nil
+		case name == NeverIndex:
+			n := Node{Kind: KindNeverIndex}
+			a, _ := f.Getattr(ctx, n)
+			return Entry{Name: name, Node: n, Attr: a}, nil
+		case IsShadowName(name):
+			return f.lookupShadow(ctx, name)
 		}
 	case KindFilesDir:
 		uuid, hasName, ok := parseName(name)
 		if !ok {
-			return Entry{}, syscall.ENOENT
+			return f.lookupWritten(ctx, name)
 		}
 		file, err := f.file(ctx, uuid)
 		if err != nil {
@@ -212,7 +343,18 @@ func (f *FS) Lookup(ctx context.Context, dir Node, name string) (Entry, error) {
 		return f.lookupFileDir(ctx, dir.UUID, name)
 	case KindVariantDir:
 		return f.lookupVariant(ctx, dir, name)
-	case KindFile, KindVariant:
+	case KindTreeDir:
+		return f.lookupTree(ctx, dir.Ops, name)
+	case KindInbox:
+		return f.lookupInbox(ctx, name)
+	case KindShadowDir:
+		return f.lookupShadow(ctx, dir.Ops+"/"+name)
+	case KindUcfsDir:
+		if name == JournalName {
+			n := Node{Kind: KindJournal}
+			return Entry{Name: name, Node: n, Attr: f.journalAttr()}, nil
+		}
+	case KindFile, KindVariant, KindTreeFile, KindShadow, KindJournal, KindNeverIndex:
 		return Entry{}, syscall.ENOTDIR
 	}
 	return Entry{}, syscall.ENOENT
@@ -221,7 +363,14 @@ func (f *FS) Lookup(ctx context.Context, dir Node, name string) (Entry, error) {
 func (f *FS) ReadDir(ctx context.Context, dir Node) ([]Entry, error) {
 	switch dir.Kind {
 	case KindRoot:
-		return []Entry{{Name: FilesDir, Node: Node{Kind: KindFilesDir}, Attr: f.dirAttr(dirTTL)}}, nil
+		never, _ := f.Lookup(ctx, dir, NeverIndex)
+		out := []Entry{
+			{Name: FilesDir, Node: Node{Kind: KindFilesDir}, Attr: f.writableDirAttr(dirTTL)},
+			{Name: TreeDir, Node: Node{Kind: KindTreeDir, Ops: "/"}, Attr: f.writableDirAttr(dirTTL)},
+			{Name: UcfsDir, Node: Node{Kind: KindUcfsDir}, Attr: f.dirAttr(dirTTL)},
+			never,
+		}
+		return f.withShadows(ctx, "", out)
 	case KindFilesDir:
 		files, err := f.ix.Files(ctx)
 		if err != nil {
@@ -232,7 +381,8 @@ func (f *FS) ReadDir(ctx context.Context, dir Node) ([]Entry, error) {
 		for i, file := range files {
 			out[i] = Entry{Name: DisplayName(file), Node: Node{Kind: KindFile, UUID: file.UUID}, Attr: fileAttr(file)}
 		}
-		return out, nil
+		out = append(out, f.spoolEntries(FilesDir)...)
+		return f.withShadows(ctx, FilesDir, out)
 	case KindFileDir:
 		file, err := f.file(ctx, dir.UUID)
 		if err != nil {
@@ -244,7 +394,15 @@ func (f *FS) ReadDir(ctx context.Context, dir Node) ([]Entry, error) {
 		}, nil
 	case KindVariantDir:
 		return f.readVariantDir(ctx, dir)
-	case KindFile, KindVariant:
+	case KindTreeDir:
+		return f.readTree(ctx, dir.Ops)
+	case KindInbox:
+		return f.readInbox(ctx)
+	case KindShadowDir:
+		return f.withShadows(ctx, dir.Ops, nil)
+	case KindUcfsDir:
+		return []Entry{{Name: JournalName, Node: Node{Kind: KindJournal}, Attr: f.journalAttr()}}, nil
+	case KindFile, KindVariant, KindTreeFile, KindShadow, KindJournal, KindNeverIndex:
 		return nil, syscall.ENOTDIR
 	}
 	return nil, syscall.ENOENT
@@ -254,14 +412,28 @@ func (f *FS) ReadDir(ctx context.Context, dir Node) ([]Entry, error) {
 // which decides from the API whether the file is really gone; a CDN 400
 // means the operations do not apply to the file.
 func (f *FS) ReadAt(ctx context.Context, n Node, p []byte, off int64) (int, error) {
-	if n.IsDir() {
+	switch {
+	case n.IsDir():
 		return 0, syscall.EISDIR
+	case n.Kind == KindTreeFile:
+		return f.readObject(ctx, n, p, off)
+	case n.Kind == KindShadow:
+		return f.readShadow(ctx, n, p, off)
+	case n.Kind == KindJournal:
+		return f.readJournal(p, off)
+	case n.Kind == KindNeverIndex:
+		return 0, io.EOF
 	}
 	file, err := f.file(ctx, n.UUID)
 	if err != nil {
 		return 0, err
 	}
-	k, size := cache.Key{UUID: n.UUID}, file.Size
+	return f.readFile(ctx, n, file, p, off)
+}
+
+// readFile reads an original, or the variant n names, through the cache.
+func (f *FS) readFile(ctx context.Context, n Node, file index.File, p []byte, off int64) (int, error) {
+	k, size := cache.Key{UUID: file.UUID}, file.Size
 	if n.Kind == KindVariant {
 		v, err := f.variant(ctx, n.UUID, n.Ops)
 		if err != nil {
@@ -338,6 +510,33 @@ func (f *FS) Path(ctx context.Context, n Node) ([]string, error) {
 			p = append(p, leafName(file, n.Ops))
 		}
 		return p, nil
+	case KindTreeDir:
+		return split(treeMount(n.Ops)), nil
+	case KindInbox:
+		return []string{TreeDir, InboxDir}, nil
+	case KindTreeFile:
+		return f.objectPath(ctx, n)
+	case KindShadow:
+		sh, err := f.ix.ShadowByIno(ctx, n.Ino)
+		if err != nil {
+			return nil, syscall.ENOENT
+		}
+		return split(sh.Path), nil
+	case KindShadowDir:
+		return split(n.Ops), nil
+	case KindUcfsDir:
+		return []string{UcfsDir}, nil
+	case KindJournal:
+		return []string{UcfsDir, JournalName}, nil
+	case KindNeverIndex:
+		return []string{NeverIndex}, nil
 	}
 	return nil, syscall.ENOENT
+}
+
+func split(p string) []string {
+	if p == "" {
+		return []string{}
+	}
+	return strings.Split(p, "/")
 }

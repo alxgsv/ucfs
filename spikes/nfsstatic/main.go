@@ -37,6 +37,7 @@ func main() {
 	readOnly := flag.Bool("read-only", false, "reject writes")
 	trace := flag.Bool("trace", false, "go-nfs trace log (every RPC)")
 	logStats := flag.Bool("log-stats", false, "log successful stat and lstat calls too")
+	unstable := flag.Bool("unstable", false, "reply UNSTABLE to WRITEs and log COMMITs (Phase 3 trace)")
 	flag.Parse()
 	if *root == "" {
 		flag.Usage()
@@ -59,7 +60,11 @@ func main() {
 		os.Exit(1)
 	}
 	st := &stats{read: map[string]int64{}, written: map[string]int64{}, ops: map[string]int{}}
-	fs := &logFS{Filesystem: osfs.New(*root, osfs.WithBoundOS()), slowDelay: *slowDelay, readOnly: *readOnly, logStats: *logStats, st: st}
+	lfs := &logFS{Filesystem: osfs.New(*root, osfs.WithBoundOS()), slowDelay: *slowDelay, readOnly: *readOnly, logStats: *logStats, st: st}
+	var fs billy.Filesystem = lfs
+	if *unstable {
+		fs = commitFS{lfs}
+	}
 	srv := &nfs.Server{
 		Handler:            nfshelper.NewCachingHandler(nfshelper.NewNullAuthHandler(fs), 1<<16),
 		ConcurrentHandlers: *concurrent,
@@ -132,6 +137,15 @@ type logFS struct {
 	readOnly  bool
 	logStats  bool
 	st        *stats
+}
+
+// commitFS implements go-nfs's Committer, which makes WRITE reply UNSTABLE,
+// so the trace shows when a client sends COMMIT.
+type commitFS struct{ *logFS }
+
+func (f commitFS) Commit(path string) error {
+	f.logOp("commit", path, nil)
+	return nil
 }
 
 func (f *logFS) logOp(op, path string, err error, args ...any) {

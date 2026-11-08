@@ -205,10 +205,11 @@ func (f *FS) recentFailure(key string) error {
 	return fl.errno
 }
 
-// Remember records the operations path of a variants view node in the index,
-// so NodeByID still resolves the node's id after a restart.
+// Remember records the path of a node known by path, a variants view or
+// tree directory node, in the index, so NodeByID still resolves the node's
+// id after a restart.
 func (f *FS) Remember(ctx context.Context, n Node) {
-	if n.Ops == "" {
+	if !n.Kind.ByPath() || n.Ops == "" || n.Ino != 0 {
 		return
 	}
 	id := n.ID()
@@ -230,11 +231,25 @@ func (f *FS) Remember(ctx context.Context, n Node) {
 }
 
 // NodeByID rebuilds a node from what a file handle carries: its kind, uuid
-// and id. Variants view nodes also need the operations path that Remember
-// stored. A node that cannot be rebuilt is ESTALE.
+// and id. Nodes known by path also need the path that Remember stored, and
+// objects must still exist. A node that cannot be rebuilt is ESTALE.
 func (f *FS) NodeByID(ctx context.Context, kind Kind, uuid string, id uint64) (Node, error) {
 	n := Node{Kind: kind, UUID: uuid}
-	if kind == KindVariantDir || kind == KindVariant {
+	switch kind {
+	case KindTreeFile:
+		n.Ino = id
+		if _, err := f.occupant(ctx, n); err != nil {
+			return Node{}, syscall.ESTALE
+		}
+		return n, nil
+	case KindShadow:
+		n.Ino = id
+		if _, err := f.ix.ShadowByIno(ctx, id); err != nil {
+			return Node{}, syscall.ESTALE
+		}
+		return n, nil
+	}
+	if kind.ByPath() {
 		f.mu.Lock()
 		ops, ok := f.nodeOps[id]
 		f.mu.Unlock()
@@ -246,8 +261,45 @@ func (f *FS) NodeByID(ctx context.Context, kind Kind, uuid string, id uint64) (N
 		}
 		n.Ops = ops
 	}
+	switch kind {
+	case KindTreeDir, KindShadowDir:
+		// A renamed directory keeps the id its handles carry; the index maps
+		// the id to the new path.
+		if ok, err := f.dirExists(ctx, n); err != nil || !ok {
+			return Node{}, syscall.ESTALE
+		}
+		if n.ID() != id {
+			n.Ino = id
+		}
+		return n, nil
+	}
 	if n.ID() != id {
 		return Node{}, syscall.ESTALE
 	}
 	return n, nil
+}
+
+func (f *FS) dirExists(ctx context.Context, n Node) (bool, error) {
+	if n.Kind == KindTreeDir {
+		return f.ix.TreeDirExists(ctx, n.Ops)
+	}
+	_, err := f.ix.Shadow(ctx, n.Ops)
+	if errors.Is(err, index.ErrNotFound) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// movedDirs re-points the handles of a renamed directory, and of those
+// below it, at their new paths, so a client that holds them, as macOS does
+// for the directory it just renamed, can go on using them.
+func (f *FS) movedDirs(ctx context.Context, from, to string) {
+	for _, p := range [][2]string{{from, to}, {treeMount(from), treeMount(to)}} {
+		if err := f.ix.MoveNodePaths(ctx, p[0], p[1]); err != nil {
+			slog.Warn("move directory handles", "from", p[0], "to", p[1], "err", err)
+		}
+	}
+	f.mu.Lock()
+	clear(f.nodeOps)
+	f.mu.Unlock()
 }
