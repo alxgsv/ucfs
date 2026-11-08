@@ -326,7 +326,15 @@ func (f *FS) Getattr(ctx context.Context, n Node) (Attr, error) {
 	return Attr{}, syscall.ENOENT
 }
 
+// ioErr is the errno of an index failure. A query the caller's context
+// cancelled is EINTR, which callers retry: FUSE cancels a request's context
+// when a signal interrupts the process waiting on it, and the Go runtime
+// sends its threads signals all the time.
 func (f *FS) ioErr(what string, err error) error {
+	if errors.Is(err, context.Canceled) {
+		slog.Debug(what, "err", err)
+		return syscall.EINTR
+	}
 	slog.Error(what, "err", err)
 	return syscall.EIO
 }
@@ -338,8 +346,7 @@ func (f *FS) file(ctx context.Context, uuid string) (index.File, error) {
 	case errors.Is(err, index.ErrNotFound) || (err == nil && file.Removed):
 		return file, syscall.ENOENT
 	case err != nil:
-		slog.Error("index lookup", "uuid", uuid, "err", err)
-		return file, syscall.EIO
+		return file, f.ioErr("index lookup "+uuid, err)
 	}
 	return file, nil
 }
@@ -413,8 +420,7 @@ func (f *FS) ReadDir(ctx context.Context, dir Node) ([]Entry, error) {
 	case KindFilesDir:
 		files, err := f.ix.Files(ctx)
 		if err != nil {
-			slog.Error("index listing", "err", err)
-			return nil, syscall.EIO
+			return nil, f.ioErr("index listing", err)
 		}
 		out := make([]Entry, len(files))
 		for i, file := range files {
@@ -453,6 +459,10 @@ func (f *FS) ReadDir(ctx context.Context, dir Node) ([]Entry, error) {
 // which decides from the API whether the file is really gone; a CDN 400
 // means the operations do not apply to the file.
 func (f *FS) ReadAt(ctx context.Context, n Node, p []byte, off int64) (int, error) {
+	// A read finishes even when its caller is interrupted: Linux reports
+	// any failed buffered FUSE read as EIO, EINTR included, and the bytes
+	// are fetched on a context of their own anyway.
+	ctx = context.WithoutCancel(ctx)
 	switch {
 	case n.IsDir():
 		return 0, syscall.EISDIR

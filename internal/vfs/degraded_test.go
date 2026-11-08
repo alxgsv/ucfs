@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"syscall"
 	"testing"
 	"time"
@@ -140,5 +141,35 @@ func TestOriginalChangedMidRead(t *testing.T) {
 	}
 	if got := read(t, env, n); !bytes.Equal(got, fake.Content(uuid(1)+"#1", size)) {
 		t.Fatal("read after the failure mixes contents")
+	}
+}
+
+// A request whose context was cancelled, as FUSE does when a signal
+// interrupts the process waiting on it, fails with EINTR, which callers
+// retry, not EIO.
+func TestCancelledRequestIsEINTR(t *testing.T) {
+	env := vfstest.New(t, file(1, "a.jpg", 10))
+	files := walk(t, env, "files").Node
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := env.FS.ReadDir(ctx, files); !errors.Is(err, syscall.EINTR) {
+		t.Errorf("readdir: %v, want EINTR", err)
+	}
+	if _, err := env.FS.Lookup(ctx, files, uuid(1)+"_a.jpg"); !errors.Is(err, syscall.EINTR) {
+		t.Errorf("lookup: %v, want EINTR", err)
+	}
+	if _, err := env.FS.Getattr(ctx, vfs.Node{Kind: vfs.KindFile, UUID: uuid(1)}); !errors.Is(err, syscall.EINTR) {
+		t.Errorf("getattr: %v, want EINTR", err)
+	}
+}
+
+// A read completes although its caller's context was cancelled.
+func TestCancelledReadCompletes(t *testing.T) {
+	env := vfstest.New(t, file(1, "a.jpg", 10))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	p := make([]byte, 10)
+	if n, err := env.FS.ReadAt(ctx, vfs.Node{Kind: vfs.KindFile, UUID: uuid(1)}, p, 0); n != 10 || (err != nil && !errors.Is(err, io.EOF)) {
+		t.Fatalf("read: %d, %v", n, err)
 	}
 }

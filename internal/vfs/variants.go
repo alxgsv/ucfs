@@ -130,8 +130,7 @@ func (f *FS) variant(ctx context.Context, uuid, ops string) (index.Variant, erro
 	case found && f.now().Sub(v.CheckedAt) < variantTTL:
 		return v, nil
 	case err != nil && !errors.Is(err, index.ErrNotFound):
-		slog.Error("variant lookup", "uuid", uuid, "ops", ops, "err", err)
-		return v, syscall.EIO
+		return v, f.ioErr("variant lookup "+uuid+"/"+ops, err)
 	}
 	key := uuid + "/" + ops
 	if err := f.recentFailure(key); err != nil {
