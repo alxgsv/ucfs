@@ -233,3 +233,27 @@ func TestTwoStreamsOnOneObject(t *testing.T) {
 		t.Errorf("streams = %d windows = %v, want 2 sequential streams", n, windows)
 	}
 }
+
+func TestSmallSequentialReadsInOneBlockDoNotPrefetch(t *testing.T) {
+	f := &fakeFetcher{data: map[string][]byte{"a": pattern(16*BlockSize, 9)}}
+	c := newCache(t, f, 1<<30)
+	k := Key{UUID: "a"}
+	buf := make([]byte, 128<<10)
+	for off := int64(0); off < BlockSize; off += int64(len(buf)) {
+		if _, err := c.ReadAt(context.Background(), k, 16*BlockSize, buf, off); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Wait()
+	if got := f.fetched.Load(); got != BlockSize {
+		t.Errorf("eight 128 KiB reads of block 0 fetched %d bytes, want one block", got)
+	}
+	// Moving into block 1 turns the stream sequential.
+	if _, err := c.ReadAt(context.Background(), k, 16*BlockSize, buf, BlockSize); err != nil {
+		t.Fatal(err)
+	}
+	c.Wait()
+	if st := c.Stats(); st.FetchedPrefetch != BlockSize {
+		t.Errorf("after crossing into block 1: %+v, want one block prefetched", st)
+	}
+}

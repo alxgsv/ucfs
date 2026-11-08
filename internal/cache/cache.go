@@ -299,8 +299,8 @@ const (
 type blockRange struct{ from, to int64 }
 
 // observe updates the sequential detector and returns the blocks to
-// prefetch. The first read of a stream prefetches nothing, so a small read
-// such as head(1) costs one block.
+// prefetch. Reads that stay within the first block of a stream prefetch
+// nothing, so a small read such as head(1) costs one block.
 func (c *Cache) observe(k Key, off, end, size int64) blockRange {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -333,7 +333,14 @@ func (c *Cache) observe(k Key, off, end, size int64) blockRange {
 		return blockRange{}
 	}
 	s.lastUsed = now
+	// The window grows per block a reader moves into, not per read call: the
+	// Linux kernel splits reads into 128 KiB requests, and growing on each
+	// one would prefetch 16 MiB for a reader that only wanted 1 MiB.
+	prevBlock := (s.next - 1) / BlockSize
 	s.next = max(s.next, end)
+	if (s.next-1)/BlockSize <= prevBlock {
+		return blockRange{}
+	}
 	s.window = min(max(2*s.window, BlockSize), c.o.MaxWindow)
 	lastBlock := (size + BlockSize - 1) / BlockSize
 	r := blockRange{
