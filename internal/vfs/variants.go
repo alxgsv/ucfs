@@ -26,7 +26,11 @@ const (
 	badTTL = time.Hour
 	// missingTTL only spans the several walks one NFS request makes; the
 	// API, not the CDN, decides that a file is gone.
-	missingTTL  = 10 * time.Second
+	missingTTL = 10 * time.Second
+	// headTimeout bounds a HEAD the CDN never answers, which would hold every
+	// lookup of the variant in its singleflight; a first render of a large
+	// variant took 21 s.
+	headTimeout = 2 * time.Minute
 	maxFailures = 4096
 	maxNodeOps  = 1 << 16
 )
@@ -133,7 +137,9 @@ func (f *FS) variant(ctx context.Context, uuid, ops string) (index.Variant, erro
 		return v, err
 	}
 	res, err, _ := f.heads.Do(key, func() (any, error) {
-		return f.head(context.WithoutCancel(ctx), v, found)
+		hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), headTimeout)
+		defer cancel()
+		return f.head(hctx, v, found)
 	})
 	if err != nil {
 		return v, err
