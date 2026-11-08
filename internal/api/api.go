@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/uploadcare/uploadcare-go/v2/file"
+	"github.com/uploadcare/uploadcare-go/v2/metadata"
 	"github.com/uploadcare/uploadcare-go/v2/project"
 	"github.com/uploadcare/uploadcare-go/v2/ucare"
 
@@ -17,6 +18,11 @@ import (
 
 // PageSize is the REST maximum for GET /files/.
 const PageSize = 1000
+
+const (
+	restHost   = "api.uploadcare.com"
+	uploadHost = "upload.uploadcare.com"
+)
 
 // File is the subset of REST file info that the index keeps.
 type File struct {
@@ -37,8 +43,12 @@ type File struct {
 
 type Client struct {
 	files   file.Service
+	meta    metadata.Service
 	project project.Service
 	stats   *Stats
+	// http and pubKey serve the Upload API, which ucfs calls directly.
+	http   *http.Client
+	pubKey string
 }
 
 // New builds a client with throttle retries enabled. A nil base transport
@@ -63,7 +73,8 @@ func New(cfg *config.Config, base http.RoundTripper) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{files: file.NewService(uc), project: project.NewService(uc), stats: stats}, nil
+	return &Client{files: file.NewService(uc), meta: metadata.NewService(uc), project: project.NewService(uc),
+		stats: stats, http: hc, pubKey: cfg.PublicKey}, nil
 }
 
 // Stats returns the HTTP counters of this client.
@@ -115,6 +126,21 @@ func (c *Client) Info(ctx context.Context, uuid string) (File, error) {
 	return fromInfo(&info), nil
 }
 
+// DeleteStorage soft-deletes a file: its info stays, its content goes.
+func (c *Client) DeleteStorage(ctx context.Context, uuid string) error {
+	_, err := c.files.Delete(ctx, uuid)
+	return err
+}
+
+func (c *Client) SetMetadata(ctx context.Context, uuid, key, value string) error {
+	_, err := c.meta.Set(ctx, uuid, key, value)
+	return err
+}
+
+func (c *Client) DeleteMetadata(ctx context.Context, uuid, key string) error {
+	return c.meta.Delete(ctx, uuid, key)
+}
+
 // IsNotFound reports a REST 404.
 func IsNotFound(err error) bool {
 	var apiErr ucare.APIError
@@ -159,13 +185,21 @@ func fromInfo(info *file.Info) File {
 type Stats struct {
 	mu        sync.Mutex
 	requests  int
+	rest      int
+	upload    int
+	parts     int
 	throttled int
 	total     time.Duration
 	max       time.Duration
 }
 
+// StatsSnapshot splits Requests into REST, Upload API and multipart part
+// PUTs, which go to storage hosts.
 type StatsSnapshot struct {
 	Requests  int
+	REST      int
+	Upload    int
+	Parts     int
 	Throttled int
 	Total     time.Duration
 	Max       time.Duration
@@ -174,13 +208,22 @@ type StatsSnapshot struct {
 func (s *Stats) Snapshot() StatsSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return StatsSnapshot{Requests: s.requests, Throttled: s.throttled, Total: s.total, Max: s.max}
+	return StatsSnapshot{Requests: s.requests, REST: s.rest, Upload: s.upload, Parts: s.parts,
+		Throttled: s.throttled, Total: s.total, Max: s.max}
 }
 
-func (s *Stats) record(d time.Duration, status int) {
+func (s *Stats) record(host string, d time.Duration, status int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.requests++
+	switch host {
+	case restHost:
+		s.rest++
+	case uploadHost:
+		s.upload++
+	default:
+		s.parts++
+	}
 	if status == http.StatusTooManyRequests {
 		s.throttled++
 	}
@@ -200,6 +243,6 @@ func (t *countingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	if resp != nil {
 		status = resp.StatusCode
 	}
-	t.stats.record(time.Since(start), status)
+	t.stats.record(req.URL.Host, time.Since(start), status)
 	return resp, err
 }
