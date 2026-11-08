@@ -1,17 +1,20 @@
 // Package ctl is the unix-socket control API of a running mount, used by
-// `ucfs status` and `ucfs umount`.
+// `ucfs status`, `ucfs umount`, `ucfs resolve` and `ucfs spool`.
 package ctl
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -22,9 +25,36 @@ type Status struct {
 	PID      int       `json:"pid"`
 	Started  time.Time `json:"started"`
 
-	Index IndexStatus `json:"index"`
-	CDN   CDNStatus   `json:"cdn"`
-	Cache CacheStatus `json:"cache"`
+	Index  IndexStatus  `json:"index"`
+	CDN    CDNStatus    `json:"cdn"`
+	Cache  CacheStatus  `json:"cache"`
+	API    APIStatus    `json:"api"`
+	Writes WritesStatus `json:"writes"`
+}
+
+// APIStatus counts requests to the REST API, the Upload API, and the
+// storage hosts multipart parts go to.
+type APIStatus struct {
+	REST      int `json:"rest"`
+	Upload    int `json:"upload"`
+	Parts     int `json:"parts"`
+	Throttled int `json:"throttled"`
+}
+
+type WritesStatus struct {
+	Enabled bool `json:"enabled"`
+	// Overwrite is the overwrite policy, replace or keep.
+	Overwrite     string `json:"overwrite,omitempty"`
+	Writing       int    `json:"writing"`
+	Queued        int    `json:"queued"`
+	Uploading     int    `json:"uploading"`
+	Failed        int    `json:"failed"`
+	Uploads       int64  `json:"uploads"`
+	UploadFails   int64  `json:"upload_failures"`
+	UploadBytes   int64  `json:"upload_bytes"`
+	ShadowCreates int64  `json:"shadow_creates"`
+	ShadowWrites  int64  `json:"shadow_writes"`
+	ShadowBytes   int64  `json:"shadow_bytes"`
 }
 
 type IndexStatus struct {
@@ -85,9 +115,15 @@ type Server struct {
 	path string
 }
 
-// Serve answers GET /status and POST /unmount on path. A socket left by a
-// daemon that died is replaced; a live one is an error.
-func Serve(path string, status func() Status, unmount func()) (*Server, error) {
+// Route is one more endpoint of the control API.
+type Route struct {
+	Pattern string
+	Handler http.HandlerFunc
+}
+
+// Serve answers GET /status, POST /unmount and the given routes on path. A
+// socket left by a daemon that died is replaced; a live one is an error.
+func Serve(path string, status func() Status, unmount func(), routes ...Route) (*Server, error) {
 	if _, err := Get(path); err == nil {
 		return nil, fmt.Errorf("a ucfs daemon already serves %s", path)
 	}
@@ -109,6 +145,9 @@ func Serve(path string, status func() Status, unmount func()) (*Server, error) {
 		w.WriteHeader(http.StatusAccepted)
 		go unmount()
 	})
+	for _, r := range routes {
+		mux.HandleFunc(r.Pattern, r.Handler)
+	}
 	s := &Server{srv: &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}, path: path}
 	go func() { _ = s.srv.Serve(l) }()
 	return s, nil
@@ -141,6 +180,49 @@ func Get(path string) (Status, error) {
 		return st, errors.New(resp.Status)
 	}
 	return st, json.NewDecoder(resp.Body).Decode(&st)
+}
+
+// Call sends in as JSON to a route of the daemon on path and decodes the
+// JSON answer into out. An answer other than 200 is an error carrying its
+// body.
+func Call(path, method, route string, in, out any) error {
+	var body io.Reader
+	if in != nil {
+		b, err := json.Marshal(in)
+		if err != nil {
+			return err
+		}
+		body = bytes.NewReader(b)
+	}
+	req, err := http.NewRequest(method, "http://ucfs"+route, body)
+	if err != nil {
+		return err
+	}
+	c := client(path)
+	c.Timeout = time.Minute
+	resp, err := c.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("%s", strings.TrimSpace(string(msg)))
+	}
+	if out == nil {
+		return nil
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// Reply writes v as the JSON answer of a route, or err as a 400.
+func Reply(w http.ResponseWriter, v any, err error) {
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 // Unmount asks the daemon to unmount and exit, and waits until its socket
