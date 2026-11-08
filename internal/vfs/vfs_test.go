@@ -65,8 +65,10 @@ func TestListingAndStatCostNoCDN(t *testing.T) {
 		}
 	}
 	walk(fs.Root(), 0)
-	if count != 1+5 {
-		t.Errorf("walked %d entries, want 6", count)
+	// The root holds files, tree, .ucfs and .metadata_never_index; files/ and
+	// tree/_inbox each list the five files; .ucfs holds the journal.
+	if count != 4+5+1+5+1 {
+		t.Errorf("walked %d entries, want 16", count)
 	}
 	if reqs, _ := env.Fake.CDNStats(); reqs != 0 {
 		t.Errorf("ls -lR equivalent made %d CDN requests", reqs)
