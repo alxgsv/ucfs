@@ -56,10 +56,13 @@ func (h *handler) Change(billy.Filesystem) billy.Change { return nil }
 
 func (h *handler) FSStat(context.Context, billy.Filesystem, *gonfs.FSStat) error { return nil }
 
-// Handle layout: version (1), kind (1), uuid (16), node id (8).
+// Handle layout: version (1), kind (1), reserved (2), uuid (16), node id (8).
+// The length must be a multiple of 4: go-nfs reads handles with
+// xdr.ReadOpaque, which skips no XDR padding, so in ACCESS, COMMIT and
+// SETATTR the arguments after an unaligned handle would be misread.
 const (
 	handleVersion = 1
-	handleLen     = 26
+	handleLen     = 28
 )
 
 func (h *handler) ToHandle(_ billy.Filesystem, p []string) []byte {
@@ -74,9 +77,9 @@ func encodeHandle(n vfs.Node) []byte {
 	b := make([]byte, handleLen)
 	b[0], b[1] = handleVersion, byte(n.Kind)
 	if n.UUID != "" {
-		_, _ = hex.Decode(b[2:18], []byte(strings.ReplaceAll(n.UUID, "-", "")))
+		_, _ = hex.Decode(b[4:20], []byte(strings.ReplaceAll(n.UUID, "-", "")))
 	}
-	binary.BigEndian.PutUint64(b[18:], n.ID())
+	binary.BigEndian.PutUint64(b[20:], n.ID())
 	return b
 }
 
@@ -88,10 +91,10 @@ func decodeHandle(b []byte) (vfs.Node, error) {
 	}
 	n := vfs.Node{Kind: vfs.Kind(b[1])}
 	if n.Kind == vfs.KindFile || n.Kind == vfs.KindFileDir {
-		x := hex.EncodeToString(b[2:18])
+		x := hex.EncodeToString(b[4:20])
 		n.UUID = x[0:8] + "-" + x[8:12] + "-" + x[12:16] + "-" + x[16:20] + "-" + x[20:32]
 	}
-	if binary.BigEndian.Uint64(b[18:]) != n.ID() {
+	if binary.BigEndian.Uint64(b[20:]) != n.ID() {
 		return vfs.Node{}, errStale
 	}
 	return n, nil

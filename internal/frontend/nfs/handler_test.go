@@ -92,6 +92,12 @@ func TestServeOverRPC(t *testing.T) {
 	if _, _, err := target.Lookup("/files/" + uuid(7) + "_nope.txt"); err == nil {
 		t.Error("lookup with the wrong name succeeded")
 	}
+	// ACCESS reads its mask after the handle, so it catches misaligned handles.
+	for _, p := range []string{"/", "/files", "/files/" + uuid(8) + "_f0008.bin"} {
+		if got, err := target.Access(p, 0x3f); err != nil || got != 0x23 {
+			t.Errorf("access %s = %#x, %v; want read, lookup and execute (0x23)", p, got, err)
+		}
+	}
 	if _, err := target.Create("/files/new.txt", 0o644); err == nil {
 		t.Error("create succeeded on a read-only export")
 	}
@@ -127,7 +133,7 @@ func TestHandleRoundTrip(t *testing.T) {
 		if err != nil || got != n {
 			t.Errorf("round trip %+v = %+v, %v", n, got, err)
 		}
-		h[5] ^= 1
+		h[7] ^= 1
 		if n.UUID != "" {
 			if _, err := decodeHandle(h); err == nil {
 				t.Errorf("tampered handle for %+v accepted", n)
