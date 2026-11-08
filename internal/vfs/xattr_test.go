@@ -49,7 +49,7 @@ func photo() fake.File {
 }
 
 func TestReadOnlyXattrs(t *testing.T) {
-	env := vfstest.New(t, photo())
+	env := vfstest.New(t, photo(), fake.File{UUID: uuid(2), Name: "big.bin", Size: 10 << 20, Uploaded: t0})
 	p := "files/" + uuid(1) + "_photo.jpg"
 	want := []string{vfs.XattrUUID, vfs.XattrCDNURL, vfs.XattrMIME, vfs.XattrMD5, vfs.XattrWidth, vfs.XattrHeight,
 		vfs.XattrStored, vfs.XattrTags, vfs.XattrMeta + "camera", vfs.XattrMeta + "ucfs:path"}
@@ -76,6 +76,9 @@ func TestReadOnlyXattrs(t *testing.T) {
 	if heads, _ := env.Fake.CDNMethods(); heads != 1 {
 		t.Errorf("md5 cost %d HEADs, want one, kept", heads)
 	}
+	if !slices.Equal(listx(t, env, p), want) {
+		t.Error("listing changed")
+	}
 	for _, name := range []string{"user.uc.nope", "security.capability", "system.posix_acl_access", "user.other"} {
 		if _, err := getx(t, env, p, name); !errors.Is(err, syscall.ENODATA) {
 			t.Errorf("getxattr %s = %v, want ENODATA", name, err)
@@ -83,6 +86,18 @@ func TestReadOnlyXattrs(t *testing.T) {
 	}
 	if got := listx(t, env, "files"); len(got) != 0 {
 		t.Errorf("a directory lists %q", got)
+	}
+	// A file of 10 MiB or more may have been uploaded in parts, whose ETag
+	// is no MD5, so md5 is not listed until known; reading it asks the CDN.
+	big := "files/" + uuid(2) + "_big.bin"
+	if got := listx(t, env, big); slices.Contains(got, vfs.XattrMD5) {
+		t.Errorf("a 10 MiB file lists md5: %q", got)
+	}
+	if got, err := getx(t, env, big, vfs.XattrMD5); err != nil || len(got) != 32 {
+		t.Errorf("md5 of a base upload of 10 MiB = %q, %v", got, err)
+	}
+	if got := listx(t, env, big); !slices.Contains(got, vfs.XattrMD5) {
+		t.Errorf("a known md5 is not listed: %q", got)
 	}
 	if err := env.FS.Setxattr(context.Background(), walk(t, env, p).Node, vfs.XattrMeta+"x", []byte("y"), 0); !errors.Is(err, syscall.EROFS) {
 		t.Errorf("setxattr on a read-only mount = %v, want EROFS", err)
@@ -338,6 +353,12 @@ func TestPendingXattrs(t *testing.T) {
 	}
 	if got, _ := getx(t, env, "tree/new.jpg", vfs.XattrMeta+"camera"); got != "Canon" {
 		t.Errorf("after the upload camera = %q", got)
+	}
+	if got, _ := getx(t, env, "tree/new.jpg", vfs.XattrMD5); got != fmt.Sprintf("%x", md5.Sum([]byte("hello"))) {
+		t.Errorf("md5 of an upload = %q", got)
+	}
+	if heads, _ := env.Fake.CDNMethods(); heads != 0 {
+		t.Errorf("the md5 of an upload cost %d HEADs", heads)
 	}
 }
 

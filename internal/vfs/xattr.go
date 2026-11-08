@@ -117,8 +117,10 @@ func (f *FS) refresh(ctx context.Context, uuid string) error {
 }
 
 // md5 is a file's content hash: the CDN's strong ETag of an original is
-// its MD5. It costs one HEAD the first time and is kept, since content
-// never changes. Empty when the ETag is not an MD5.
+// its MD5, except for multipart uploads, whose ETag is S3's hash of the
+// parts' hashes with a "-<parts>" suffix. It costs one HEAD the first time
+// and is kept, since content never changes; files the mount uploaded have
+// it from their upload. Empty when the ETag is not an MD5.
 func (f *FS) md5(ctx context.Context, d index.Details) (string, error) {
 	if d.MD5 != "" {
 		return d.MD5, nil
@@ -177,13 +179,14 @@ func (f *FS) target(ctx context.Context, n Node) (xattrTarget, bool, error) {
 }
 
 // fileXattrs are the attributes of an uploaded file, as name-value pairs.
-// md5 is listed with an empty value that Getxattr fills.
+// md5 is listed with an empty value that Getxattr fills, when it is known
+// or the file is too small to have been uploaded in parts.
 func (f *FS) fileXattrs(d index.Details) [][2]string {
 	out := [][2]string{{XattrUUID, d.UUID}, {XattrCDNURL, f.cdnURL(d.UUID, "")}}
 	if d.MIME != "" {
 		out = append(out, [2]string{XattrMIME, d.MIME})
 	}
-	if d.IsReady {
+	if d.MD5 != "" || (d.IsReady && d.Size < api.MinMultipart) {
 		out = append(out, [2]string{XattrMD5, ""})
 	}
 	if d.Width > 0 && d.Height > 0 {
@@ -271,21 +274,20 @@ func (f *FS) Getxattr(ctx context.Context, n Node, name string) ([]byte, error) 
 	if err != nil {
 		return nil, err
 	}
+	if name == XattrMD5 && d != nil {
+		sum, err := f.md5(ctx, *d)
+		switch {
+		case err != nil:
+			return nil, err
+		case sum == "":
+			return nil, syscall.ENODATA
+		}
+		return []byte(sum), nil
+	}
 	for _, a := range attrs {
-		if a[0] != name {
-			continue
+		if a[0] == name {
+			return []byte(a[1]), nil
 		}
-		if name == XattrMD5 && d != nil {
-			sum, err := f.md5(ctx, *d)
-			if err != nil {
-				return nil, err
-			}
-			if sum == "" {
-				return nil, syscall.ENODATA
-			}
-			return []byte(sum), nil
-		}
-		return []byte(a[1]), nil
 	}
 	return nil, syscall.ENODATA
 }
