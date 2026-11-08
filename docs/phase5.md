@@ -33,7 +33,7 @@ a probe of 22,191 B, 20 of 21.6–22.4 KB, one of 3,519,550 B, one of 12,208,903
 | `rsync` of large files beside a `cat` of a small one keeps the small read's p95 within a bound | against the fake (30 ms CDN latency, 8 slots, 4 readers streaming 64 MiB files): p95 of a cold 64 KiB read 37 ms alone, 34 ms beside them, against 304 ms with a plain bound of the same size; the test's bound is twice alone plus one request. Live: p95 420 ms alone, 727 ms beside a reader streaming the 12 MB image, with 0 waits for a slot (see *Backpressure*) |
 | The config-permission check refuses a 0644 file | yes: `ucfs: config file is readable by group or others: <path> has mode 0644; run chmod 600 <path>, or pass --insecure-config to use it anyway`; 0640 refused too, 0600 and `--insecure-config` accepted |
 | Zero secret hits in the logs | 0 hits for either key of `alex-gusev-test` in every live `-v` log (`spikes/keygrep`, *Security*) |
-| The benchmark table from CI | see *Benchmarks and CI*: GitHub refused to start the jobs (account billing), so the table is from the same steps run on Ubuntu 26.04 in the VM |
+| The benchmark table from CI | yes, from [run 42505053658](https://github.com/alxgsv/ucfs/actions/runs/42505053658) once GitHub started running jobs (it refused the first four runs for the account's billing); also from the same steps in the VM (*Benchmarks and CI*) |
 | The soak curves show no growth | partly: over 3 hours per platform against the fake and 2 hours live, goroutines, descriptors and the cache stay flat and the live run is flat throughout; the index file grows with churn by design (rows of removed files); RSS rose 86 → 108 MiB on macOS with a flat Go heap, and the Linux heap 46 → 80 MiB, mostly go-fuse nodes of entries the kernel still caches (*Soak*) |
 | The fixtures' uuids before and after, unchanged | see *End state* |
 
@@ -261,15 +261,29 @@ read. `ls -l` of 10,000 entries is index-only (0 CDN requests) at about 12 µs a
 (golangci-lint v2.11.3), build for both, `make race` on `ubuntu-latest` with `fuse3` and `UCFS_MOUNT_TESTS=1` (FUSE
 mounted, and a test that cannot mount fails rather than skips), and `make bench` with the table, compared with the
 previous run's (kept with `actions/cache`), in the job summary and the raw output as an artifact. Nothing needs the
-project's keys. GitHub refused to start the jobs of this pull request: "The job was not started because recent account
-payments have failed or your spending limit needs to be increased" (the account's billing settings). The same steps
-ran in the Linux VM instead (*CI steps in the VM*).
+project's keys. GitHub refused the first four runs of this pull request without starting a job: "The job was not
+started because recent account payments have failed or your spending limit needs to be increased" (the account's
+billing). From 17:27 UTC the jobs ran. On commit 3111f1a ([run 42505053658](https://github.com/alxgsv/ucfs/actions/runs/42505053658))
+lint for both systems passed in 2 min 10 s and the benchmarks in 2 min 36 s; the race job, 4 minutes in, was cancelled
+by the next push, as the workflow's concurrency group asks; the run on the phase's last commit is on the pull request's checks.
 
-**CI steps in the VM.** On commit 57cd878, exported with `git archive` into a clean directory of the VM and run as the
-normal user, as on a runner: `make build cross` passed; `UCFS_MOUNT_TESTS=1 make race` passed every package with FUSE
-mounted through `fusermount3` (some packages from Go's test cache of an earlier run of the same code); `make bench`
-gave the right-hand column above. Lint for linux and darwin ran on the Mac with the version the workflow pins
-(golangci-lint 2.11.3): 0 issues. The workflow itself was never run by GitHub, so its YAML is untested on a runner.
+The benchmarks on the runner (linux/amd64, AMD EPYC 7763), from that run's artifact:
+
+| benchmark | ms/op | MB/s | p95 alone | p95 beside | p95 plain bound |
+|---|---:|---:|---:|---:|---:|
+| ColdCat5MB | 98.7 | 50.6 | | | |
+| LsL10000 | 377.1 | | | | |
+| VariantReaders | | | 43.7 ms | 154.5 ms | |
+| SmallReadBesideBulk | | | 32.0 ms | 66.9 ms | 553.6 ms |
+
+On the runner's few cores the readers beside a bulk reader are slower than on the Mac and in the VM: the fake, in the
+same process, generates the bulk reader's bytes, and the CPU it takes is the readers'. The queue still keeps a small
+read at an eighth of what a plain bound gives. `ls -l` of 10,000 entries is CPU-bound and three times slower there.
+
+**CI steps in the VM.** Before GitHub ran the jobs, the same steps ran on commit 57cd878, exported with `git archive`
+into a clean directory of the VM and run as the normal user, as on a runner: `make build cross` passed;
+`UCFS_MOUNT_TESTS=1 make race` passed every package with FUSE mounted through `fusermount3`; `make bench` gave the
+right-hand column of the table above. Lint ran on the Mac with the version the workflow pins: 0 issues.
 
 ## Soak
 
@@ -400,13 +414,13 @@ The full 24 hours are `make soak` (or `make soak SOAK=6h`), which writes `bin/so
   index.
 - **Two flaky NFS tests**: the RPC test client binds a random local port that may be in use, and keeps directory
   entries in a map, so their order varies; the tests retry the dial and sort.
-- **CI could not run**: GitHub refused the jobs for the account's billing (*Benchmarks and CI*).
+- **CI could not run at first**: GitHub refused the jobs for the account's billing until 17:27 UTC (*Benchmarks and
+  CI*).
 
 ## Deferred
 
 - **To Phase 6:** a 24-hour soak (`make soak`; this phase ran 3 hours per platform against the fake and 2 hours
-  live) and a green run of the workflow on GitHub once the account can run jobs; offering the go-nfs patches upstream
-  (errnos, COMMIT, ACCESS filter), which needs the user's OK.
+  live); offering the go-nfs patches upstream (errnos, COMMIT, ACCESS filter), which needs the user's OK.
 - **To V1.1:** keeping other local processes off the loopback NFS port (FUSE-T, or checking the peer socket's owner on
   macOS); telling the FUSE kernel about removed files so go-fuse can drop their nodes (`NotifyDelete` on the sweep);
   pruning index rows of files removed long ago; fewer prefetch slots for a reader on a slow link, where the queue
