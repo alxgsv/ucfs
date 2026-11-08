@@ -198,3 +198,37 @@ func TestReopenKeepsSchema(t *testing.T) {
 		}
 	}
 }
+
+func TestSweepAndRefreshMarkRemoved(t *testing.T) {
+	ctx := context.Background()
+	srv, client, ix := setup(t)
+	fs := files(0, 5)
+	srv.Add(fs...)
+	if _, err := ix.Sync(ctx, client, false); err != nil {
+		t.Fatal(err)
+	}
+
+	srv.Remove(fs[1].UUID)
+	n, err := ix.SweepRemoved(ctx, client)
+	if err != nil || n != 1 {
+		t.Fatalf("sweep marked %d, err %v; want 1", n, err)
+	}
+	if n, _ := ix.SweepRemoved(ctx, client); n != 0 {
+		t.Errorf("second sweep marked %d again", n)
+	}
+
+	srv.Remove(fs[3].UUID)
+	changed := 0
+	loop := &Loop{Index: ix, Source: client, Changed: func() { changed++ }}
+	loop.Refresh(ctx, fs[3].UUID)
+	if f, err := ix.Get(ctx, fs[3].UUID); err != nil || !f.Removed {
+		t.Errorf("after refresh: %+v %v", f, err)
+	}
+	loop.Refresh(ctx, fs[4].UUID) // still present: stays
+	if f, _ := ix.Get(ctx, fs[4].UUID); f.Removed {
+		t.Error("refresh removed a present file")
+	}
+	if st, _ := ix.Stats(ctx); st.Files != 3 || changed != 2 {
+		t.Errorf("files = %d, changed = %d; want 3 and 2", st.Files, changed)
+	}
+}

@@ -56,7 +56,7 @@ func newRootCmd() *cobra.Command {
 	f.StringVar(&g.CacheDir, "cache-dir", "", "cache directory (default <user cache dir>/ucfs/<public key>)")
 	f.BoolVarP(&g.verbose, "verbose", "v", false, "debug logging")
 
-	root.AddCommand(newVersionCmd(), newIndexCmd(g))
+	root.AddCommand(newVersionCmd(), newIndexCmd(g), newMountCmd(g), newUmountCmd(g), newStatusCmd(g))
 	return root
 }
 

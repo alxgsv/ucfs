@@ -25,8 +25,8 @@ func newIndexSyncCmd(g *globalFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "sync",
 		Short: "List the project's files into the local index",
-		Long: "Lists files uploaded since the last sync (all files on the first run or with --full)\n" +
-			"and stores them in the index under the cache directory.",
+		Long: "Lists files uploaded since the last sync (all files on the first run or with --full),\n" +
+			"marks files removed since then, and stores the result in the index under the cache directory.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := g.load()
@@ -44,6 +44,10 @@ func newIndexSyncCmd(g *globalFlags) *cobra.Command {
 			defer func() { _ = ix.Close() }()
 
 			res, syncErr := ix.Sync(cmd.Context(), client, full)
+			var removed int
+			if syncErr == nil {
+				removed, syncErr = ix.SweepRemoved(cmd.Context(), client)
+			}
 			hs := client.Stats()
 			st, err := ix.Stats(cmd.Context())
 			if err != nil {
@@ -58,9 +62,9 @@ func newIndexSyncCmd(g *globalFlags) *cobra.Command {
 			if name == "" {
 				name = cfg.PublicKey
 			}
-			_, err = fmt.Fprintf(out, "%s: %s sync listed %d files (%d new) in %s; %d requests, %d throttled\n"+
+			_, err = fmt.Fprintf(out, "%s: %s sync listed %d files (%d new, %d newly removed) in %s; %d requests, %d throttled\n"+
 				"index: %d files, %d stored, %s, %s\n",
-				name, mode, res.Listed, res.Added, res.Duration.Round(time.Millisecond), hs.Requests, hs.Throttled,
+				name, mode, res.Listed, res.Added, removed, res.Duration.Round(time.Millisecond), hs.Requests, hs.Throttled,
 				st.Files, st.Stored, humanize.IBytes(uint64(st.Bytes)), cfg.IndexPath())
 			if syncErr != nil {
 				return syncErr

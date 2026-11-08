@@ -1,9 +1,13 @@
-// Package fake provides httptest doubles of the Uploadcare REST API for tests.
+// Package fake provides httptest doubles of the Uploadcare REST API and CDN
+// for tests.
 package fake
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
+	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -44,15 +48,114 @@ type Server struct {
 	files    []File
 	throttle int
 	requests int
+	latency  map[string]time.Duration
+	cdnReqs  int
+	cdnBytes int64
 }
 
 func New(t testing.TB) *Server {
-	s := &Server{}
+	s := &Server{latency: map[string]time.Duration{}}
+	rest := http.NewServeMux()
+	rest.HandleFunc("GET /files/", s.listFiles)
+	rest.HandleFunc("GET /files/{uuid}/", s.fileInfo)
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /files/", s.listFiles)
-	s.Server = httptest.NewServer(s.count(mux))
+	mux.Handle("/", s.count(rest))
+	mux.HandleFunc("GET /cdn/{uuid}/", s.serveCDN)
+	mux.HandleFunc("HEAD /cdn/{uuid}/", s.serveCDN)
+	s.Server = httptest.NewServer(mux)
 	t.Cleanup(s.Close)
 	return s
+}
+
+// CDNBase is the base URL of the fake CDN.
+func (s *Server) CDNBase() string { return s.URL + "/cdn" }
+
+// Content is the deterministic body the fake CDN serves for a file.
+func Content(uuid string, size int64) []byte {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(uuid))
+	r := rand.New(rand.NewPCG(h.Sum64(), 0))
+	b := make([]byte, size)
+	for i := range b {
+		b[i] = byte(r.Uint32())
+	}
+	return b
+}
+
+// SetLatency delays every CDN response for one file.
+func (s *Server) SetLatency(uuid string, d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.latency[uuid] = d
+}
+
+// Remove marks a file removed, as a soft delete would.
+func (s *Server) Remove(uuid string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.files {
+		if s.files[i].UUID == uuid {
+			s.files[i].Removed = true
+		}
+	}
+}
+
+// CDNStats returns the CDN requests served and body bytes written.
+func (s *Server) CDNStats() (requests int, bytes int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cdnReqs, s.cdnBytes
+}
+
+func (s *Server) find(uuid string) (File, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, f := range s.files {
+		if f.UUID == uuid {
+			return f, true
+		}
+	}
+	return File{}, false
+}
+
+func (s *Server) fileInfo(w http.ResponseWriter, r *http.Request) {
+	f, ok := s.find(r.PathValue("uuid"))
+	if !ok {
+		http.Error(w, `{"detail":"Not found."}`, http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(fileJSON(f))
+}
+
+func (s *Server) serveCDN(w http.ResponseWriter, r *http.Request) {
+	uuid := r.PathValue("uuid")
+	f, ok := s.find(uuid)
+	s.mu.Lock()
+	s.cdnReqs++
+	delay := s.latency[uuid]
+	s.mu.Unlock()
+	time.Sleep(delay)
+	if !ok || f.Removed {
+		http.NotFound(w, r)
+		return
+	}
+	cw := &countingWriter{ResponseWriter: w}
+	http.ServeContent(cw, r, "", f.Uploaded, bytes.NewReader(Content(uuid, f.Size)))
+	s.mu.Lock()
+	s.cdnBytes += cw.n
+	s.mu.Unlock()
+}
+
+type countingWriter struct {
+	http.ResponseWriter
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.ResponseWriter.Write(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // Add puts files into the project; listing order is by upload time.
@@ -78,6 +181,7 @@ func (s *Server) Requests() int {
 }
 
 // Transport routes requests for the real API hosts to this server.
+// The CDN needs no rewriting: point the CDN base at CDNBase.
 func (s *Server) Transport() http.RoundTripper {
 	target, _ := url.Parse(s.URL)
 	return roundTripFunc(func(req *http.Request) (*http.Response, error) {
