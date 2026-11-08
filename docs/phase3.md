@@ -213,6 +213,26 @@ this phase came to about 80 MB, abandoned multipart parts included.
   `ls` got ENOENT once. Handle ids of tree and shadow directories now follow renames.
 - **Exclusive CREATE was refused** by go-nfs (NOTSUPP), which vim's swap files need; it is now served as guarded.
 
+## API access lost after the cleanup
+
+Times are UTC on 2026-11-08 (the hosts' clocks are UTC+6).
+
+- **Last successful REST calls:** `uploadcare file list` verifying the end state at 09:16:48. The macOS mount's sync
+  loop ran without an error until that mount was unmounted at 09:17:05.
+- **First refusal:** at 09:25:39 `ucfs mount` failed its initial sync with `403 forbidden: Operation denied.` From
+  then on every REST call for `uploadcare-go-test` got the same answer, the CLI's and `GET /project/` included; the
+  CDN still served. Nothing live was tried after that.
+- **What this phase sent, approximately** (from the daemon logs and `ucfs status`):
+  - about 283 uploads that completed: 168 from macOS, 115 from Linux. 3 of them were multipart uploads of 3 parts
+    each; 2 more multipart uploads were started and abandoned by the crash tests. With the CLI's text probe, that
+    comes to about 290 Upload API requests and about 12 part PUTs, roughly 80 MB.
+  - about 286 soft-deletes (`DELETE /files/{uuid}/storage/`), one per upload: 224 for the cleanup, 54 through
+    the overwrite policy (50 of them the Linux `cp -R` onto the Mac's folder), the rest `rm` tests and the two
+    abandoned multipart uploads.
+  - 44 metadata PUTs (42 renames, 2 through the CLI) and about 56 file info reads (overwrites and crash recovery).
+  - several hundred `GET /files/` listings: the sync loop ran every 5 s on macOS for the first 16 minutes, then
+    every 30 s, plus removed sweeps and about 20 CLI listings and info reads.
+
 ## Not covered
 
 - **TextEdit itself**, blocked by its dialog; the NSDocument path it uses was measured with a tool.
