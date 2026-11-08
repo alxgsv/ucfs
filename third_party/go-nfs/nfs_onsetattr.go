@@ -1,3 +1,6 @@
+// Modified for ucfs: errors carrying an errno map to the matching NFS status
+// (see statusFromError). Upstream: github.com/willscott/go-nfs c092ae79c64e.
+
 package nfs
 
 import (
@@ -31,7 +34,7 @@ func onSetAttr(ctx context.Context, w *response, userHandle Handler) error {
 		if os.IsNotExist(err) {
 			return &NFSStatusError{NFSStatusNoEnt, err}
 		}
-		return &NFSStatusError{NFSStatusAccess, err}
+		return &NFSStatusError{statusFromError(err, NFSStatusAccess), err}
 	}
 
 	// see if there's a "guard"
@@ -55,8 +58,7 @@ func onSetAttr(ctx context.Context, w *response, userHandle Handler) error {
 
 	changer := userHandle.Change(fs)
 	if err := attrs.Apply(changer, fs, fs.Join(path...)); err != nil {
-		// Already an nfsstatuserror
-		return err
+		return asStatusError(err, NFSStatusIO)
 	}
 
 	preAttr := ToFileAttribute(info, fullPath).AsCache()

@@ -1,3 +1,7 @@
+// Modified for ucfs: exclusive CREATE is served as guarded, and errors carrying
+// an errno map to the matching NFS status (see statusFromError). Upstream:
+// github.com/willscott/go-nfs c092ae79c64e.
+
 package nfs
 
 import (
@@ -39,9 +43,10 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 		if err := xdr.Read(w.req.Body, &verf); err != nil {
 			return &NFSStatusError{NFSStatusInval, err}
 		}
-		Log.Errorf("failing create to indicate lack of support for 'exclusive' mode.")
-		// TODO: support 'exclusive' mode.
-		return &NFSStatusError{NFSStatusNotSupp, os.ErrPermission}
+		// ucfs: exclusive create, which open(O_EXCL) sends, is served as
+		// guarded. The verifier is not kept, so a retransmitted request
+		// fails with EXIST; on a loopback TCP connection that does not
+		// happen.
 	} else {
 		// invalid
 		return &NFSStatusError{NFSStatusNotSupp, os.ErrInvalid}
@@ -65,12 +70,12 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 		if s.IsDir() {
 			return &NFSStatusError{NFSStatusExist, nil}
 		}
-		if how == createModeGuarded {
+		if how == createModeGuarded || how == createModeExclusive {
 			return &NFSStatusError{NFSStatusExist, os.ErrPermission}
 		}
 	} else {
 		if s, err := fs.Stat(fs.Join(path...)); err != nil {
-			return &NFSStatusError{NFSStatusAccess, err}
+			return &NFSStatusError{statusFromError(err, NFSStatusAccess), err}
 		} else if !s.IsDir() {
 			return &NFSStatusError{NFSStatusNotDir, nil}
 		}
@@ -79,18 +84,20 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 	file, err := fs.Create(newFilePath)
 	if err != nil {
 		Log.Errorf("Error Creating: %v", err)
-		return &NFSStatusError{NFSStatusAccess, err}
+		return &NFSStatusError{statusFromError(err, NFSStatusAccess), err}
 	}
 	if err := file.Close(); err != nil {
 		Log.Errorf("Error Creating: %v", err)
-		return &NFSStatusError{NFSStatusAccess, err}
+		return &NFSStatusError{statusFromError(err, NFSStatusAccess), err}
 	}
 
 	fp := userHandle.ToHandle(fs, newFile)
 	changer := userHandle.Change(fs)
-	if err := attrs.Apply(changer, fs, newFilePath); err != nil {
-		Log.Errorf("Error applying attributes: %v\n", err)
-		return &NFSStatusError{NFSStatusIO, err}
+	if attrs != nil {
+		if err := attrs.Apply(changer, fs, newFilePath); err != nil {
+			Log.Errorf("Error applying attributes: %v\n", err)
+			return asStatusError(err, NFSStatusIO)
+		}
 	}
 
 	writer := bytes.NewBuffer([]byte{})

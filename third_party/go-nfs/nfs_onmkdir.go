@@ -1,3 +1,6 @@
+// Modified for ucfs: errors carrying an errno map to the matching NFS status
+// (see statusFromError). Upstream: github.com/willscott/go-nfs c092ae79c64e.
+
 package nfs
 
 import (
@@ -56,14 +59,14 @@ func onMkdir(ctx context.Context, w *response, userHandle Handler) error {
 	}
 
 	if err := fs.MkdirAll(newFolderPath, attrs.Mode(mkdirDefaultMode)); err != nil {
-		return &NFSStatusError{NFSStatusAccess, err}
+		return &NFSStatusError{statusFromError(err, NFSStatusAccess), err}
 	}
 
 	fp := userHandle.ToHandle(fs, newFolder)
 	changer := userHandle.Change(fs)
 	if changer != nil {
 		if err := attrs.Apply(changer, fs, newFolderPath); err != nil {
-			return &NFSStatusError{NFSStatusIO, err}
+			return asStatusError(err, NFSStatusIO)
 		}
 	}
 

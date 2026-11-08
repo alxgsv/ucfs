@@ -1,3 +1,7 @@
+// Modified for ucfs: COMMIT calls Committer.Commit, and errors carrying an errno
+// map to the matching NFS status (see statusFromError). Upstream:
+// github.com/willscott/go-nfs c092ae79c64e.
+
 package nfs
 
 import (
@@ -9,7 +13,16 @@ import (
 	"github.com/willscott/go-nfs-client/nfs/xdr"
 )
 
-// onCommit - note this is a no-op, as we always push writes to the backing store.
+// Committer is implemented by a filesystem that wants COMMIT, the only
+// close-like event of NFSv3. WRITE then replies UNSTABLE when the client asks
+// for it, so the client follows its writes with a COMMIT, which calls Commit
+// with the file's path.
+type Committer interface {
+	Commit(path string) error
+}
+
+// onCommit calls Commit on a Committer; otherwise it is a no-op, as writes
+// always reach the backing store.
 func onCommit(ctx context.Context, w *response, userHandle Handler) error {
 	w.errorFmt = wccDataErrorFormatter
 	handle, err := xdr.ReadOpaque(w.req.Body)
@@ -24,6 +37,12 @@ func onCommit(ctx context.Context, w *response, userHandle Handler) error {
 	}
 	if !billy.CapabilityCheck(fs, billy.WriteCapability) {
 		return &NFSStatusError{NFSStatusServerFault, os.ErrPermission}
+	}
+
+	if c, ok := fs.(Committer); ok {
+		if err := c.Commit(fs.Join(path...)); err != nil {
+			return &NFSStatusError{statusFromError(err, NFSStatusIO), err}
+		}
 	}
 
 	writer := bytes.NewBuffer([]byte{})

@@ -1,3 +1,6 @@
+// Modified for ucfs: errors carrying an errno map to the matching NFS status
+// (see statusFromError). Upstream: github.com/willscott/go-nfs c092ae79c64e.
+
 package nfs
 
 import (
@@ -86,10 +89,7 @@ func onRemoveObj(ctx context.Context, w *response, userHandle Handler, directory
 		if os.IsNotExist(err) {
 			return &NFSStatusError{NFSStatusNoEnt, err}
 		}
-		if os.IsPermission(err) {
-			return &NFSStatusError{NFSStatusAccess, err}
-		}
-		return &NFSStatusError{NFSStatusIO, err}
+		return &NFSStatusError{statusFromError(err, NFSStatusIO), err}
 	}
 
 	if err := userHandle.InvalidateHandle(fs, toDeleteHandle); err != nil {
