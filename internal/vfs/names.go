@@ -6,6 +6,7 @@ import (
 
 	"golang.org/x/text/unicode/norm"
 
+	"github.com/alxgsv/ucfs/internal/cdn"
 	"github.com/alxgsv/ucfs/internal/index"
 )
 
@@ -29,11 +30,42 @@ func DisplayName(f index.File) string {
 	if name == "" {
 		name = unnamed
 	}
-	s := f.UUID + "_" + name
-	if len(s) <= nameMax {
+	return truncate(f.UUID+"_"+name, nameMax)
+}
+
+// baseName is a file's original name as one path component of files/<uuid>/
+// and the variants view. It is mapped like DisplayName; names a directory
+// cannot hold as an entry, and "-", which is the variants directory, become
+// unnamed.
+func baseName(f index.File) string {
+	name := nameReplacer.Replace(f.Name)
+	switch name {
+	case "", ".", "..", VariantsDir:
+		name = unnamed
+	}
+	return truncate(name, nameMax)
+}
+
+// leafName names the variant in an operation or argument directory: the
+// original's name with the extension of the format the operations select.
+func leafName(f index.File, ops string) string {
+	name := baseName(f)
+	ext := cdn.OutputExt(ops)
+	if ext == "" {
+		return name
+	}
+	if i := strings.LastIndexByte(name, '.'); i > 0 {
+		name = name[:i]
+	}
+	return truncate(name, nameMax-1-len(ext)) + "." + ext
+}
+
+// truncate cuts s to at most n bytes on a rune boundary.
+func truncate(s string, n int) string {
+	if len(s) <= n {
 		return s
 	}
-	s = s[:nameMax]
+	s = s[:max(n, 0)]
 	for !utf8.ValidString(s) {
 		s = s[:len(s)-1]
 	}

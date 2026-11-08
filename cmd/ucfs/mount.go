@@ -105,7 +105,7 @@ func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) er
 	defer c.Wait()
 
 	loop := &index.Loop{Index: ix, Source: client, Interval: f.syncInterval, SweepEvery: f.sweepInterval}
-	fsys := vfs.New(ix, c, func(uuid string) { loop.Refresh(context.WithoutCancel(ctx), uuid) })
+	fsys := vfs.New(ix, c, cd, func(uuid string) { loop.Refresh(context.WithoutCancel(ctx), uuid) })
 	loop.Changed = fsys.Touch
 	loopCtx, stopLoop := context.WithCancel(ctx)
 	defer stopLoop()
@@ -135,7 +135,7 @@ func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) er
 			st.Index.SyncError = serr.Error()
 		}
 		cs := cd.Stats()
-		st.CDN = ctl.CDNStatus{Requests: cs.Requests, Bytes: cs.Bytes}
+		st.CDN = ctl.CDNStatus{Requests: cs.Requests, Heads: cs.Heads, Gets: cs.Gets, Bytes: cs.Bytes}
 		ks := c.Stats()
 		st.Cache = ctl.CacheStatus{Served: ks.Served, Hit: ks.Hit, FetchedDemand: ks.FetchedDemand,
 			FetchedPrefetch: ks.FetchedPrefetch, Used: ks.Used, Max: ks.Max}

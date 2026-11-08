@@ -2,8 +2,12 @@ package nfs
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -122,25 +126,96 @@ func TestServeOverRPC(t *testing.T) {
 }
 
 func TestHandleRoundTrip(t *testing.T) {
-	for _, n := range []vfs.Node{
-		{Kind: vfs.KindRoot},
-		{Kind: vfs.KindFilesDir},
-		{Kind: vfs.KindFile, UUID: uuid(42)},
-		{Kind: vfs.KindFileDir, UUID: uuid(42)},
+	env := vfstest.New(t, fake.File{UUID: uuid(42), Name: "hero.jpg", Size: 10, Uploaded: t0})
+	h := newHandler(env.FS)
+	// A second filesystem on the same index stands in for a restarted daemon.
+	restarted := newHandler(vfs.New(env.Index, env.Cache, env.CDN, nil))
+	ctx := context.Background()
+	for _, p := range []string{
+		"",
+		"files",
+		"files/" + uuid(42) + "_hero.jpg",
+		"files/" + uuid(42),
+		"files/" + uuid(42) + "/-",
+		"files/" + uuid(42) + "/-/resize/10x/-/format",
+		"files/" + uuid(42) + "/-/resize/10x/-/format/webp/hero.webp",
 	} {
-		h := encodeHandle(n)
-		got, err := decodeHandle(h)
-		if err != nil || got != n {
-			t.Errorf("round trip %+v = %+v, %v", n, got, err)
+		e, err := env.FS.Walk(ctx, p)
+		if err != nil {
+			t.Fatalf("walk %q: %v", p, err)
 		}
-		h[7] ^= 1
-		if n.UUID != "" {
-			if _, err := decodeHandle(h); err == nil {
-				t.Errorf("tampered handle for %+v accepted", n)
+		b := h.ToHandle(h.fs, strings.Split(p, "/"))
+		if len(b)%4 != 0 {
+			t.Errorf("%q: handle of %d bytes is not XDR aligned", p, len(b))
+		}
+		for _, hh := range []*handler{h, restarted} {
+			if got, err := hh.decodeHandle(ctx, b); err != nil || got != e.Node {
+				t.Errorf("round trip %q = %+v, %v; want %+v", p, got, err, e.Node)
+			}
+		}
+		if _, path, err := restarted.FromHandle(b); err != nil || strings.Join(path, "/") != p {
+			t.Errorf("path of %q after restart = %q, %v", p, path, err)
+		}
+		b[7] ^= 1
+		if e.Node.UUID != "" {
+			if _, err := h.decodeHandle(ctx, b); err == nil {
+				t.Errorf("tampered handle for %q accepted", p)
 			}
 		}
 	}
-	if _, err := decodeHandle([]byte{1, 2, 3}); err == nil {
+	unknown := encodeHandle(vfs.Node{Kind: vfs.KindVariantDir, UUID: uuid(42), Ops: "-/never/handed/out/"})
+	if _, err := h.decodeHandle(ctx, unknown); err == nil {
+		t.Error("handle of a node never handed out resolved")
+	}
+	if _, err := h.decodeHandle(ctx, []byte{1, 2, 3}); err == nil {
 		t.Error("short handle accepted")
+	}
+}
+
+func TestVariantsOverRPC(t *testing.T) {
+	const size = 3<<20 + 5
+	env := vfstest.New(t, fake.File{UUID: uuid(1), Name: "hero.jpg", Size: size, MIME: "image/jpeg", Uploaded: t0})
+	target := mount(t, env)
+	dir := "/files/" + uuid(1) + "/-/resize/1200x/-/format/webp"
+
+	entries, err := target.ReadDirPlus(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _, _ := env.Fake.Variant(uuid(1), "-/resize/1200x/-/format/webp/")
+	var listed []string
+	for _, e := range entries {
+		if e.FileName == "." || e.FileName == ".." {
+			continue
+		}
+		listed = append(listed, e.FileName)
+		if e.Size() != int64(len(body)) {
+			t.Errorf("listed size %d, want %d", e.Size(), len(body))
+		}
+	}
+	if len(listed) != 1 || listed[0] != "hero.webp" {
+		t.Errorf("listing = %q, want the one default entry", listed)
+	}
+
+	f, err := target.Open(dir + "/hero.webp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(f)
+	_ = f.Close()
+	if err != nil || !bytes.Equal(got, body) {
+		t.Errorf("read %d bytes, %v; content mismatch", len(got), err)
+	}
+	if heads, _ := env.Fake.CDNMethods(); heads != 1 {
+		t.Errorf("%d HEADs for listing and reading one variant", heads)
+	}
+
+	var nerr *nfsc.Error
+	_, _, err = target.Lookup("/files/" + uuid(1) + "/-/resize/" + fake.BadArg + "/hero.jpg")
+	if !errors.As(err, &nerr) || nerr.ErrorNum != nfsc.NFS3ErrInval {
+		t.Errorf("lookup of a variant the CDN rejects: %v, want NFS3ERR_INVAL", err)
+	}
+	if _, _, err := target.Lookup("/files/" + uuid(1) + "/-/nosuchop"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("lookup of an unknown operation: %v, want NFS3ERR_NOENT", err)
 	}
 }

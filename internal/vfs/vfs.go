@@ -12,9 +12,12 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 
 	"github.com/alxgsv/ucfs/internal/cache"
 	"github.com/alxgsv/ucfs/internal/cdn"
@@ -27,14 +30,26 @@ const (
 	KindRoot Kind = iota + 1
 	KindFilesDir
 	KindFile
-	// KindFileDir is files/<uuid>/, resolvable but not listed; Phase 2 puts
-	// variants under it.
+	// KindFileDir is files/<uuid>/, resolvable but not listed in files/. It
+	// holds the original under its own name and the variants directory "-".
 	KindFileDir
+	// KindVariantDir is a directory of the variants view: "-" itself, an
+	// operation or an argument.
+	KindVariantDir
+	// KindVariant is the file in an operation or argument directory.
+	KindVariant
 )
+
+// HasUUID reports whether nodes of this kind belong to one file.
+func (k Kind) HasUUID() bool { return k != KindRoot && k != KindFilesDir }
 
 type Node struct {
 	Kind Kind
 	UUID string
+	// Ops is the operations path of a variants view node in the form the CDN
+	// URL takes: "-/" for files/<uuid>/-, and "-/resize/1200x/" for that
+	// argument directory and for the variant inside it.
+	Ops string
 }
 
 // ID is the node's stable 64-bit identity, used as inode and NFS file id.
@@ -49,11 +64,15 @@ func (n Node) ID() uint64 {
 		_, _ = h.Write([]byte("files\x00" + n.UUID + "\x00"))
 	case KindFileDir:
 		_, _ = h.Write([]byte("files\x00" + n.UUID + "\x00/"))
+	case KindVariantDir:
+		_, _ = h.Write([]byte("files\x00" + n.UUID + "\x00" + n.Ops))
+	case KindVariant:
+		_, _ = h.Write([]byte("files\x00" + n.UUID + "\x00" + n.Ops + "\x00"))
 	}
 	return h.Sum64()
 }
 
-func (n Node) IsDir() bool { return n.Kind != KindFile }
+func (n Node) IsDir() bool { return n.Kind != KindFile && n.Kind != KindVariant }
 
 // Attr carries attributes plus how long a kernel may cache them.
 type Attr struct {
@@ -77,19 +96,35 @@ const (
 	dirTTL = 5 * time.Second
 )
 
+// Header asks the CDN about a variant; cdn.Client implements it.
+type Header interface {
+	Head(ctx context.Context, uuid, ops string) (cdn.Info, error)
+}
+
 type FS struct {
 	ix    *index.Index
 	cache *cache.Cache
+	cdn   Header
+	now   func() time.Time
 	// dirMtime moves whenever the index changes, so NFS clients that compare
 	// directory mtimes re-read the listing.
 	dirMtime atomic.Int64
 	missing  func(uuid string)
+
+	// heads shares one HEAD among concurrent lookups of a variant.
+	heads singleflight.Group
+	mu    sync.Mutex
+	// failed holds recent HEAD failures by uuid and ops.
+	failed map[string]failure
+	// nodeOps holds the operations paths of node ids already in the index.
+	nodeOps map[uint64]string
 }
 
 // New builds the filesystem. missing is called, in its own goroutine, when
 // the CDN answers 404 for a file the index has.
-func New(ix *index.Index, c *cache.Cache, missing func(uuid string)) *FS {
-	f := &FS{ix: ix, cache: c, missing: missing}
+func New(ix *index.Index, c *cache.Cache, head Header, missing func(uuid string)) *FS {
+	f := &FS{ix: ix, cache: c, cdn: head, now: time.Now, missing: missing,
+		failed: map[string]failure{}, nodeOps: map[uint64]string{}}
 	f.Touch()
 	return f
 }
@@ -119,11 +154,20 @@ func (f *FS) Getattr(ctx context.Context, n Node) (Attr, error) {
 			return Attr{}, err
 		}
 		return fileAttr(file), nil
-	case KindFileDir:
+	case KindFileDir, KindVariantDir:
 		if _, err := f.file(ctx, n.UUID); err != nil {
 			return Attr{}, err
 		}
 		return f.dirAttr(fileTTL), nil
+	case KindVariant:
+		if _, err := f.file(ctx, n.UUID); err != nil {
+			return Attr{}, err
+		}
+		v, err := f.variant(ctx, n.UUID, n.Ops)
+		if err != nil {
+			return Attr{}, err
+		}
+		return f.variantAttr(v), nil
 	}
 	return Attr{}, syscall.ENOENT
 }
@@ -164,7 +208,11 @@ func (f *FS) Lookup(ctx context.Context, dir Node, name string) (Entry, error) {
 			return Entry{}, syscall.ENOENT
 		}
 		return Entry{Name: name, Node: Node{Kind: KindFile, UUID: uuid}, Attr: fileAttr(file)}, nil
-	case KindFile:
+	case KindFileDir:
+		return f.lookupFileDir(ctx, dir.UUID, name)
+	case KindVariantDir:
+		return f.lookupVariant(ctx, dir, name)
+	case KindFile, KindVariant:
 		return Entry{}, syscall.ENOTDIR
 	}
 	return Entry{}, syscall.ENOENT
@@ -186,39 +234,62 @@ func (f *FS) ReadDir(ctx context.Context, dir Node) ([]Entry, error) {
 		}
 		return out, nil
 	case KindFileDir:
-		if _, err := f.file(ctx, dir.UUID); err != nil {
+		file, err := f.file(ctx, dir.UUID)
+		if err != nil {
 			return nil, err
 		}
-		return nil, nil
-	case KindFile:
+		return []Entry{
+			{Name: baseName(file), Node: Node{Kind: KindFile, UUID: file.UUID}, Attr: fileAttr(file)},
+			{Name: VariantsDir, Node: Node{Kind: KindVariantDir, UUID: file.UUID, Ops: opsRoot}, Attr: f.dirAttr(fileTTL)},
+		}, nil
+	case KindVariantDir:
+		return f.readVariantDir(ctx, dir)
+	case KindFile, KindVariant:
 		return nil, syscall.ENOTDIR
 	}
 	return nil, syscall.ENOENT
 }
 
 // ReadAt reads file content. A CDN 404 hands the uuid to the missing hook,
-// which decides from the API whether the file is really gone.
+// which decides from the API whether the file is really gone; a CDN 400
+// means the operations do not apply to the file.
 func (f *FS) ReadAt(ctx context.Context, n Node, p []byte, off int64) (int, error) {
-	if n.Kind != KindFile {
+	if n.IsDir() {
 		return 0, syscall.EISDIR
 	}
 	file, err := f.file(ctx, n.UUID)
 	if err != nil {
 		return 0, err
 	}
-	got, err := f.cache.ReadAt(ctx, cache.Key{UUID: n.UUID}, file.Size, p, off)
+	k, size := cache.Key{UUID: n.UUID}, file.Size
+	if n.Kind == KindVariant {
+		v, err := f.variant(ctx, n.UUID, n.Ops)
+		if err != nil {
+			return 0, err
+		}
+		k, size = cache.Key{UUID: n.UUID, Ops: n.Ops, Version: v.ETag}, v.Size
+	}
+	got, err := f.cache.ReadAt(ctx, k, size, p, off)
+	var bad *cdn.BadRequestError
 	switch {
 	case err == nil || errors.Is(err, io.EOF):
 		return got, err
 	case errors.Is(err, cdn.ErrNotFound):
-		f.cache.Forget(cache.Key{UUID: n.UUID})
-		if f.missing != nil {
-			go f.missing(n.UUID)
-		}
+		f.cache.Forget(k)
+		f.notFound(n.UUID)
 		return got, syscall.ENOENT
+	case errors.As(err, &bad):
+		slog.Info("CDN rejected a variant", "uuid", n.UUID, "ops", n.Ops, "message", bad.Message)
+		return got, syscall.EINVAL
 	default:
-		slog.Error("read", "uuid", n.UUID, "off", off, "err", err)
+		slog.Error("read", "uuid", n.UUID, "ops", n.Ops, "off", off, "err", err)
 		return got, syscall.EIO
+	}
+}
+
+func (f *FS) notFound(uuid string) {
+	if f.missing != nil {
+		go f.missing(uuid)
 	}
 }
 
@@ -257,6 +328,16 @@ func (f *FS) Path(ctx context.Context, n Node) ([]string, error) {
 			return nil, err
 		}
 		return []string{FilesDir, n.UUID}, nil
+	case KindVariantDir, KindVariant:
+		file, err := f.file(ctx, n.UUID)
+		if err != nil {
+			return nil, err
+		}
+		p := append([]string{FilesDir, n.UUID}, strings.Split(strings.TrimSuffix(n.Ops, "/"), "/")...)
+		if n.Kind == KindVariant {
+			p = append(p, leafName(file, n.Ops))
+		}
+		return p, nil
 	}
 	return nil, syscall.ENOENT
 }

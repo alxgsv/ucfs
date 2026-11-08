@@ -75,11 +75,11 @@ func printStatus(w io.Writer, st ctl.Status) error {
 	}
 	_, err := fmt.Fprintf(w, "%s  %s, %s, pid %d, up %s\n"+
 		"  index  %d files, %s; last sync %s ago (%s)\n"+
-		"  cdn    %d requests, %s (%d bytes)\n"+
+		"  cdn    %d requests (%d HEAD, %d GET), %s (%d bytes)\n"+
 		"  cache  served %s, %s from disk; fetched %s on demand + %s prefetched; %s of %s used\n",
 		st.MountDir, st.Project, st.Frontend, st.PID, time.Since(st.Started).Round(time.Second),
 		st.Index.Files, b(st.Index.Bytes), time.Since(st.Index.LastSync).Round(time.Second), syncState,
-		st.CDN.Requests, b(st.CDN.Bytes), st.CDN.Bytes,
+		st.CDN.Requests, st.CDN.Heads, st.CDN.Gets, b(st.CDN.Bytes), st.CDN.Bytes,
 		b(st.Cache.Served), b(st.Cache.Hit), b(st.Cache.FetchedDemand), b(st.Cache.FetchedPrefetch),
 		b(st.Cache.Used), b(st.Cache.Max))
 	return err

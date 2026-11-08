@@ -36,6 +36,8 @@ type IndexStatus struct {
 
 type CDNStatus struct {
 	Requests int64 `json:"requests"`
+	Heads    int64 `json:"heads"`
+	Gets     int64 `json:"gets"`
 	Bytes    int64 `json:"bytes"`
 }
 
