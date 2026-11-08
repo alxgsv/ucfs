@@ -284,6 +284,17 @@ func (ix *Index) advanceCursor(ctx context.Context, tx *sql.Tx, t time.Time) err
 	return err
 }
 
+// Synced reports whether a full listing went through once, so the index
+// holds the project, even an empty one.
+func (ix *Index) Synced(ctx context.Context) (bool, error) {
+	var v string
+	err := ix.db.QueryRowContext(ctx, `SELECT value FROM sync_state WHERE key = ?`, keyLastFullScan).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 // Cursor is the newest upload time seen, zero before the first sync.
 func (ix *Index) Cursor(ctx context.Context) (time.Time, error) {
 	var v string

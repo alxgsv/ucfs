@@ -378,9 +378,18 @@ func (s *Server) deleteStorage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"detail":"Not found."}`, http.StatusNotFound)
 		return
 	}
+	s.forget(uuid)
 	f, _ := s.find(uuid)
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(s.fileJSON(f))
+}
+
+// forget drops a removed file's uploaded bytes, which the CDN no longer
+// serves, so a long run of uploads and deletes keeps the fake small.
+func (s *Server) forget(uuid string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.up.content, uuid)
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

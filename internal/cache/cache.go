@@ -460,20 +460,27 @@ func (c *Cache) observe(k Key, off, end, size int64) (r blockRange, epoch uint64
 	epoch = c.epochs[base]
 	ss := c.streams[base]
 	var s *stream
+	old := -1
 	for i, cand := range ss {
 		if off < cand.next-streamSlack || off > cand.next+max(cand.window, streamSlack) {
 			continue
 		}
-		if cand.epoch != epoch {
-			ss = append(ss[:i:i], ss[i+1:]...)
-			c.streams[base] = ss
-			if off > 0 {
-				return blockRange{}, epoch, true
-			}
+		if cand.epoch == epoch {
+			s = cand
 			break
 		}
-		s = cand
-		break
+		if old < 0 {
+			old = i
+		}
+	}
+	// A reader that started anew since the change has a current stream,
+	// matched first; only a read no current stream explains is stale.
+	if s == nil && old >= 0 {
+		ss = append(ss[:old:old], ss[old+1:]...)
+		c.streams[base] = ss
+		if off > 0 {
+			return blockRange{}, epoch, true
+		}
 	}
 	if s == nil {
 		if len(c.streams) >= maxTrackedObjects {

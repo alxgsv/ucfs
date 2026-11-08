@@ -113,3 +113,19 @@ func TestFairnessSmallReadBesideBulk(t *testing.T) {
 		t.Fatalf("p95 beside bulk readers %v, alone %v: want at most twice alone plus one request", fair, alone)
 	}
 }
+
+// BenchmarkSmallReadBesideBulk reports the p95 of cold 64 KiB reads alone,
+// beside four bulk readers with the limiter, and beside them with a plain
+// bound of the same size.
+func BenchmarkSmallReadBesideBulk(b *testing.B) {
+	var alone, fair, fifo []time.Duration
+	for b.Loop() {
+		alone = append(alone, fairRun(b, 0, 20, false)...)
+		fair = append(fair, fairRun(b, 4, 20, false)...)
+		fifo = append(fifo, fairRun(b, 4, 20, true)...)
+	}
+	ms := func(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
+	b.ReportMetric(ms(percentile(alone, 0.95)), "p95-alone-ms")
+	b.ReportMetric(ms(percentile(fair, 0.95)), "p95-beside-ms")
+	b.ReportMetric(ms(percentile(fifo, 0.95)), "p95-fifo-ms")
+}

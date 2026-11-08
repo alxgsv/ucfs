@@ -49,8 +49,10 @@ func newHandler(v *vfs.FS) *handler {
 	return &handler{fs: &billyFS{v: v, uid: uint32(os.Getuid()), gid: uint32(os.Getgid())}, listings: map[uint64]listing{}}
 }
 
+// Mount offers AUTH_UNIX only: offered AUTH_NULL, the macOS client sends no
+// uid, and FilterAccess could not tell its users apart.
 func (h *handler) Mount(context.Context, net.Conn, gonfs.MountRequest) (gonfs.MountStatus, billy.Filesystem, []gonfs.AuthFlavor) {
-	return gonfs.MountStatusOk, h.fs, []gonfs.AuthFlavor{gonfs.AuthFlavorNull}
+	return gonfs.MountStatusOk, h.fs, []gonfs.AuthFlavor{gonfs.AuthFlavorUnix}
 }
 
 // Change accepts mode, owner and time changes and ignores them: files are

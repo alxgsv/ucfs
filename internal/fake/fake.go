@@ -3,10 +3,10 @@
 package fake
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
@@ -71,6 +71,7 @@ type Server struct {
 	cdnStatus     int
 	originalGen   map[string]int
 	etags         map[string]string
+	cdnLatency    time.Duration
 	restLatency   time.Duration
 	restInflight  int
 	restPeak      int
@@ -158,10 +159,13 @@ func (s *Server) Variant(uuid, ops string) (body []byte, etag, mime string) {
 	s.mu.Lock()
 	gen := s.variantsGen
 	s.mu.Unlock()
-	return variant(f, ops, gen)
+	r, etag, mime := variant(f, ops, gen)
+	body = make([]byte, r.Size())
+	_, _ = r.ReadAt(body, 0)
+	return body, etag, mime
 }
 
-func variant(f File, ops string, gen int) (body []byte, etag, mime string) {
+func variant(f File, ops string, gen int) (body *io.SectionReader, etag, mime string) {
 	key := fmt.Sprintf("%s|%s|%d", f.UUID, ops, gen)
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(key))
@@ -169,7 +173,7 @@ func variant(f File, ops string, gen int) (body []byte, etag, mime string) {
 	if i := strings.LastIndex(ops, "/format/"); i >= 0 {
 		mime = "image/" + strings.SplitN(ops[i+len("/format/"):], "/", 2)[0]
 	}
-	return Content(key, f.Size/2+int64(len(ops))), fmt.Sprintf(`W/"%016x"`, h.Sum64()), mime
+	return io.NewSectionReader(generated(key), 0, f.Size/2+int64(len(ops))), fmt.Sprintf(`W/"%016x"`, h.Sum64()), mime
 }
 
 // ChangeVariants makes the CDN render every variant anew, as an engine
@@ -178,6 +182,14 @@ func (s *Server) ChangeVariants() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.variantsGen++
+}
+
+// SetCDNLatency delays every CDN response for files without a latency of
+// their own.
+func (s *Server) SetCDNLatency(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cdnLatency = d
 }
 
 // SetLatency delays every CDN response for one file.
@@ -196,6 +208,7 @@ func (s *Server) Remove(uuid string) {
 			s.files[i].Removed = true
 		}
 	}
+	delete(s.up.content, uuid)
 }
 
 // CDNStats returns the CDN requests served and body bytes written.
@@ -241,7 +254,10 @@ func (s *Server) serveCDN(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodHead {
 		s.cdnHeads++
 	}
-	delay := s.latency[uuid]
+	delay, own := s.latency[uuid]
+	if !own {
+		delay = s.cdnLatency
+	}
 	gen := s.variantsGen
 	failStatus := s.cdnStatus
 	s.mu.Unlock()
@@ -270,7 +286,7 @@ func (s *Server) serveCDN(w http.ResponseWriter, r *http.Request) {
 		body, etag, mime := variant(f, ops, gen)
 		cw.Header().Set("ETag", etag)
 		cw.Header().Set("Content-Type", mime)
-		http.ServeContent(cw, r, "", time.Time{}, bytes.NewReader(body))
+		http.ServeContent(cw, r, "", time.Time{}, body)
 	}
 }
 

@@ -27,7 +27,7 @@ func writable(t *testing.T, w *vfs.Writes, files ...fake.File) *vfstest.Env {
 	return env
 }
 
-func walk(t *testing.T, env *vfstest.Env, p string) vfs.Entry {
+func walk(t testing.TB, env *vfstest.Env, p string) vfs.Entry {
 	t.Helper()
 	e, err := env.FS.Walk(context.Background(), p)
 	if err != nil {

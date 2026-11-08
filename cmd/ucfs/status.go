@@ -107,7 +107,7 @@ func printStatus(w io.Writer, st ctl.Status) error {
 	b := func(n int64) string { return humanize.IBytes(uint64(n)) }
 	syncState := "ok"
 	if st.Index.SyncError != "" {
-		syncState = fmt.Sprintf("failed %d times in a row: %s; next try in %s", st.Index.SyncFailures,
+		syncState = fmt.Sprintf("%d syncs failed in a row, the last with: %s; next try in %s", st.Index.SyncFailures,
 			st.Index.SyncError, time.Until(st.Index.NextSync).Round(time.Second))
 	}
 	_, err := fmt.Fprintf(w, "%s  %s, %s, pid %d, up %s\n"+

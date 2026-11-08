@@ -175,11 +175,11 @@ func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) er
 	// An index synced before serves at once, whatever the API says now,
 	// and the loop brings it up to date in the background; a new one has
 	// nothing to serve until a full listing went through.
-	cursor, err := ix.Cursor(ctx)
+	synced, err := ix.Synced(ctx)
 	if err != nil {
 		return err
 	}
-	if cursor.IsZero() {
+	if !synced {
 		if _, err := ix.Sync(ctx, client, false); err != nil {
 			return fmt.Errorf("initial index sync: %w", err)
 		}
@@ -335,8 +335,19 @@ func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) er
 func processStatus() ctl.ProcessStatus {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
-	fds, _ := os.ReadDir("/dev/fd")
-	return ctl.ProcessStatus{Goroutines: runtime.NumGoroutine(), FDs: len(fds), HeapBytes: m.HeapInuse}
+	return ctl.ProcessStatus{Goroutines: runtime.NumGoroutine(), FDs: openFDs(), HeapBytes: m.HeapInuse}
+}
+
+// openFDs counts the entries of /dev/fd, less the one reading it. Names
+// only: on macOS, stat of some entries fails, which stops os.ReadDir.
+func openFDs() int {
+	d, err := os.Open("/dev/fd")
+	if err != nil {
+		return 0
+	}
+	defer func() { _ = d.Close() }()
+	names, _ := d.Readdirnames(-1)
+	return len(names) - 1
 }
 
 func dbBytes(path string) int64 {
