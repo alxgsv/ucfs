@@ -61,6 +61,8 @@ CREATE INDEX aliases_uuid ON aliases (uuid);
 ALTER TABLE shadow ADD COLUMN ino INTEGER;
 ALTER TABLE shadow ADD COLUMN dir INTEGER NOT NULL DEFAULT 0;
 CREATE UNIQUE INDEX shadow_ino ON shadow (ino);
+`, `
+ALTER TABLE spools ADD COLUMN queued TEXT NOT NULL DEFAULT '';
 `}
 
 const (
@@ -159,7 +161,7 @@ func (ix *Index) Sync(ctx context.Context, l Lister, full bool) (SyncResult, err
 		if len(batch) == 0 {
 			return nil
 		}
-		err := ix.upsert(ctx, batch, true)
+		err := ix.upsert(ctx, batch, true, time.Now())
 		res.Listed += len(batch)
 		batch = batch[:0]
 		return err
@@ -183,11 +185,11 @@ func (ix *Index) Sync(ctx context.Context, l Lister, full bool) (SyncResult, err
 	return res, errors.Join(err, cerr)
 }
 
-// upsert stores listed files and advances the sync cursor past them.
-// advance is false for files the mount uploaded itself: their upload time
-// comes from the local clock, and a cursor moved by it could skip files
-// other clients uploaded in between.
-func (ix *Index) upsert(ctx context.Context, files []api.File, advance bool) error {
+// upsert stores files fetched at a time and advances the sync cursor past
+// them. advance is false for files the mount uploaded itself: their upload
+// time comes from the local clock, and a cursor moved by it could skip
+// files other clients uploaded in between.
+func (ix *Index) upsert(ctx context.Context, files []api.File, advance bool, at time.Time) error {
 	tx, err := ix.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -210,7 +212,7 @@ func (ix *Index) upsert(ctx context.Context, files []api.File, advance bool) err
 	if err != nil {
 		return err
 	}
-	now := time.Now().Unix()
+	now := at.Unix()
 	var cursor time.Time
 	for _, f := range files {
 		meta, err := json.Marshal(f.Metadata)

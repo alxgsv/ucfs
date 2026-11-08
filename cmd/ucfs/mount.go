@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/dustin/go-humanize"
@@ -31,6 +33,9 @@ type mountFlags struct {
 	cacheSize     string
 	syncInterval  time.Duration
 	sweepInterval time.Duration
+	views         []string
+	metaTTL       time.Duration
+	dateZone      string
 	writeFlags
 }
 
@@ -60,13 +65,44 @@ func newMountCmd(g *globalFlags) *cobra.Command {
 	fl.BoolVar(&f.browse, "browse", false, "show the mount in the Finder sidebar (macOS)")
 	fl.StringVar(&f.cacheSize, "cache-size", "2GiB", "on-disk block cache limit")
 	fl.DurationVar(&f.syncInterval, "sync-interval", 30*time.Second, "how often to list new uploads")
-	fl.DurationVar(&f.sweepInterval, "sweep-interval", 10*time.Minute, "how often to look for removed files")
+	fl.DurationVar(&f.sweepInterval, "sweep-interval", 10*time.Minute, "how often to look for removed files and new groups")
+	fl.StringSliceVar(&f.views, "views", vfs.DefaultViews, "views to mount: "+strings.Join(vfs.AllViews, ","))
+	fl.DurationVar(&f.metaTTL, "meta-ttl", vfs.DefaultMetaTTL,
+		"reading xattrs or resolving a file fetches its info again when the index copy is older than this")
+	fl.StringVar(&f.dateZone, "by-date-zone", "Local", "time zone of by-date/: Local, UTC or a zone name such as Europe/Berlin")
 	f.register(fl)
 	return cmd
 }
 
+// viewOptions checks --views, --meta-ttl and --by-date-zone.
+func (f *mountFlags) viewOptions() (vfs.Options, error) {
+	o := vfs.Options{MetaTTL: f.metaTTL}
+	if len(f.views) == 0 {
+		return o, errors.New("--views: name at least one view")
+	}
+	for _, v := range f.views {
+		if !slices.Contains(vfs.AllViews, v) {
+			return o, fmt.Errorf("--views: unknown view %q; views are %s", v, strings.Join(vfs.AllViews, ","))
+		}
+	}
+	o.Views = f.views
+	if f.metaTTL <= 0 {
+		return o, errors.New("--meta-ttl must be positive")
+	}
+	zone, err := time.LoadLocation(f.dateZone)
+	if err != nil {
+		return o, fmt.Errorf("--by-date-zone: %w", err)
+	}
+	o.DateZone = zone
+	return o, nil
+}
+
 func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) error {
 	opts, err := f.options()
+	if err != nil {
+		return err
+	}
+	vopts, err := f.viewOptions()
 	if err != nil {
 		return err
 	}
@@ -111,7 +147,12 @@ func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) er
 	defer c.Wait()
 
 	loop := &index.Loop{Index: ix, Source: client, Interval: f.syncInterval, SweepEvery: f.sweepInterval}
+	if slices.Contains(vopts.Views, vfs.ViewGroups) {
+		loop.Groups = client
+	}
 	fsys := vfs.New(ix, c, cd, func(uuid string) { loop.Refresh(context.WithoutCancel(ctx), uuid) })
+	vopts.CDNBase, vopts.Remote = cfg.CDNBase, client
+	fsys.Configure(vopts)
 	loop.Changed = fsys.Touch
 	journal := &spool.Journal{Path: filepath.Join(cfg.CacheDir, "uploads.log")}
 	fsys.Journal(journal.Path)
@@ -154,7 +195,8 @@ func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) er
 		name = cfg.PublicKey
 	}
 	status := func() ctl.Status {
-		st := ctl.Status{MountDir: dir, Frontend: f.frontend, Project: name, PID: os.Getpid(), Started: started}
+		st := ctl.Status{MountDir: dir, Frontend: f.frontend, Project: name, PID: os.Getpid(), Started: started,
+			Views: fsys.Views()}
 		if is, err := ix.Stats(context.Background()); err == nil {
 			st.Index.Files, st.Index.Bytes = is.Files, is.Bytes
 		}
@@ -173,6 +215,10 @@ func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) er
 			FetchedPrefetch: ks.FetchedPrefetch, Used: ks.Used, Max: ks.Max}
 		as := client.Stats()
 		st.API = ctl.APIStatus{REST: as.REST, Upload: as.Upload, Parts: as.Parts, Throttled: as.Throttled}
+		ms := fsys.MetaStats()
+		st.Meta = ctl.MetaStatus{TTL: vopts.MetaTTL, Refreshes: ms.Refreshes, RefreshErrors: ms.RefreshErrors,
+			XattrLists: ms.Lists, XattrGets: ms.Gets, XattrSets: ms.Sets, XattrRemoves: ms.Removes,
+			MD5Heads: ms.MD5Heads, GroupFetches: ms.GroupFetches}
 		if spools != nil {
 			ss, ws := spools.Stats(), fsys.WriteStats()
 			st.Writes = ctl.WritesStatus{Enabled: true, Overwrite: f.overwrite,
@@ -188,7 +234,7 @@ func runMount(ctx context.Context, g *globalFlags, f *mountFlags, dir string) er
 		case unmountReq <- struct{}{}:
 		default:
 		}
-	}, routes(fsys, spools, journal, cfg.CDNBase)...)
+	}, routes(fsys, spools, journal)...)
 	if err != nil {
 		return errors.Join(err, m.Unmount())
 	}

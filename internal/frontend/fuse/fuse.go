@@ -38,6 +38,11 @@ var (
 	_ gofs.NodeRmdirer   = (*node)(nil)
 	_ gofs.NodeMkdirer   = (*node)(nil)
 	_ gofs.NodeRenamer   = (*node)(nil)
+
+	_ gofs.NodeGetxattrer    = (*node)(nil)
+	_ gofs.NodeListxattrer   = (*node)(nil)
+	_ gofs.NodeSetxattrer    = (*node)(nil)
+	_ gofs.NodeRemovexattrer = (*node)(nil)
 )
 
 // cur is the node as the vfs knows it now. Directories in tree/ and shadow
@@ -117,8 +122,8 @@ func (n *node) Readdir(ctx context.Context) (gofs.DirStream, syscall.Errno) {
 	return gofs.NewListDirStream(out), 0
 }
 
-// Open keeps the page cache across opens of originals in files/, whose
-// content never changes. A variant's content can change when its HEAD is
+// Open keeps the page cache across opens of originals in files/, by-date/,
+// tags/ and groups/, whose content never changes. A variant's content can change when its HEAD is
 // renewed, and a tree file's when it is overwritten.
 func (n *node) Open(ctx context.Context, flags uint32) (gofs.FileHandle, uint32, syscall.Errno) {
 	if n.n.IsDir() {
@@ -130,10 +135,11 @@ func (n *node) Open(ctx context.Context, flags uint32) (gofs.FileHandle, uint32,
 		}
 		return nil, 0, 0
 	}
-	if n.n.Kind != vfs.KindFile {
-		return nil, 0, 0
+	switch n.n.Kind {
+	case vfs.KindFile, vfs.KindDateFile, vfs.KindViewFile:
+		return nil, gofuse.FOPEN_KEEP_CACHE, 0
 	}
-	return nil, gofuse.FOPEN_KEEP_CACHE, 0
+	return nil, 0, 0
 }
 
 // Create is only sent for a name the kernel did not find, but another
@@ -225,6 +231,43 @@ func (n *node) Rename(ctx context.Context, name string, newParent gofs.InodeEmbe
 	return errno0(n.v.Rename(ctx, n.cur(), name, to, newName))
 }
 
+// fill answers a getxattr or listxattr: with a buffer too small, which
+// includes the size probe of an empty one, the size and ERANGE.
+func fill(dest, v []byte) (uint32, syscall.Errno) {
+	if len(dest) < len(v) {
+		return uint32(len(v)), syscall.ERANGE
+	}
+	return uint32(copy(dest, v)), 0
+}
+
+func (n *node) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
+	v, err := n.v.Getxattr(ctx, n.cur(), attr)
+	if err != nil {
+		return 0, errno(err)
+	}
+	return fill(dest, v)
+}
+
+func (n *node) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.Errno) {
+	names, err := n.v.Listxattr(ctx, n.cur())
+	if err != nil {
+		return 0, errno(err)
+	}
+	var b []byte
+	for _, name := range names {
+		b = append(append(b, name...), 0)
+	}
+	return fill(dest, b)
+}
+
+func (n *node) Setxattr(ctx context.Context, attr string, data []byte, flags uint32) syscall.Errno {
+	return errno0(n.v.Setxattr(ctx, n.cur(), attr, data, int(flags)))
+}
+
+func (n *node) Removexattr(ctx context.Context, attr string) syscall.Errno {
+	return errno0(n.v.Removexattr(ctx, n.cur(), attr))
+}
+
 func errno0(err error) syscall.Errno {
 	if err == nil {
 		return 0
@@ -261,6 +304,8 @@ func Mount(dir string, v *vfs.FS, debug bool) (*gofuse.Server, error) {
 			MaxWrite:     maxIO,
 			DirectMount:  true,
 			Debug:        debug,
+			// The kernel asks for security.capability before every write.
+			IgnoreSecurityLabels: true,
 		},
 		NegativeTimeout: &negative,
 		UID:             uint32(os.Getuid()),

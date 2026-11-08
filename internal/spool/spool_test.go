@@ -390,3 +390,43 @@ func TestRecoverAbandonedMultipart(t *testing.T) {
 		t.Error("the abandoned multipart upload is still listed")
 	}
 }
+
+func TestQueuedMetadata(t *testing.T) {
+	ctx := context.Background()
+	old := fake.File{UUID: "00000000-0000-4000-8000-000000000001", Name: "a.txt", Size: 3, Uploaded: time.Now().Add(-time.Hour),
+		Metadata: map[string]string{"camera": "Canon", "lens": "50mm"}, Tags: []string{"old"}}
+	e := newEnv(t, Options{Metadata: map[string]string{"ucfs:test": "1", "lens": "flag"}}, old)
+	s, err := e.m.Create(ctx, "tree/a.txt", index.Object{Ino: NewIno()}, old.UUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, s, []byte("new"))
+	if err := s.Queue(func(q *index.Queued) error {
+		q.Meta["lens"] = "35mm"
+		q.Meta["ucfs:path"] = "/elsewhere"
+		tags := []string{"new"}
+		q.Tags = &tags
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The queue survives a restart with the spool.
+	s.mu.Lock()
+	s.row.State, s.row.Committed = Queued, time.Now()
+	s.persistLocked()
+	s.mu.Unlock()
+	m2 := e.open(t, Options{Metadata: map[string]string{"ucfs:test": "1", "lens": "flag"}})
+	if q := m2.At("tree/a.txt").Queued(); q.Meta["lens"] != "35mm" {
+		t.Fatalf("queue after reopening = %+v", q)
+	}
+	m2.Recover(ctx)
+	deadline := time.Now().Add(5 * time.Second)
+	for m2.At("tree/a.txt") != nil && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	f := e.uploaded(t, "a.txt")
+	if f.Metadata["camera"] != "Canon" || f.Metadata["lens"] != "35mm" || f.Metadata["ucfs:test"] != "1" ||
+		f.Metadata["ucfs:path"] != "/a.txt" || strings.Join(f.Tags, ",") != "new" {
+		t.Errorf("uploaded with metadata %v, tags %q", f.Metadata, f.Tags)
+	}
+}

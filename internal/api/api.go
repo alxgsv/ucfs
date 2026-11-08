@@ -9,8 +9,10 @@ import (
 	"time"
 
 	"github.com/uploadcare/uploadcare-go/v2/file"
+	"github.com/uploadcare/uploadcare-go/v2/group"
 	"github.com/uploadcare/uploadcare-go/v2/metadata"
 	"github.com/uploadcare/uploadcare-go/v2/project"
+	"github.com/uploadcare/uploadcare-go/v2/tag"
 	"github.com/uploadcare/uploadcare-go/v2/ucare"
 
 	"github.com/alxgsv/ucfs/internal/config"
@@ -38,12 +40,17 @@ type File struct {
 	Width      int
 	Height     int
 	Metadata   map[string]string
-	Tags       []string
+	// Tags is nil when the file info has no tags field: the project lacks
+	// the tags feature.
+	Tags []string
 }
 
 type Client struct {
+	uc      ucare.Client
 	files   file.Service
 	meta    metadata.Service
+	tags    tag.Service
+	groups  group.Service
 	project project.Service
 	stats   *Stats
 	// http and pubKey serve the Upload API, which ucfs calls directly.
@@ -73,8 +80,8 @@ func New(cfg *config.Config, base http.RoundTripper) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{files: file.NewService(uc), meta: metadata.NewService(uc), project: project.NewService(uc),
-		stats: stats, http: hc, pubKey: cfg.PublicKey}, nil
+	return &Client{uc: uc, files: file.NewService(uc), meta: metadata.NewService(uc), tags: tag.NewService(uc),
+		groups: group.NewService(uc), project: project.NewService(uc), stats: stats, http: hc, pubKey: cfg.PublicKey}, nil
 }
 
 // Stats returns the HTTP counters of this client.
@@ -139,6 +146,75 @@ func (c *Client) SetMetadata(ctx context.Context, uuid, key, value string) error
 
 func (c *Client) DeleteMetadata(ctx context.Context, uuid, key string) error {
 	return c.meta.Delete(ctx, uuid, key)
+}
+
+// SetTags replaces a file's tags and returns the list the API stored,
+// normalised.
+func (c *Client) SetTags(ctx context.Context, uuid string, tags []string) ([]string, error) {
+	res, err := c.tags.Replace(ctx, uuid, tags)
+	return res.Tags, err
+}
+
+// Group is a file group. Members are the files in group order, nil where
+// the API returns no file; only GroupInfo fills them.
+type Group struct {
+	ID        string
+	CreatedAt time.Time
+	Members   []*File
+}
+
+// ListGroups walks GET /groups/ in creation order from a time, inclusive at
+// second precision.
+func (c *Client) ListGroups(ctx context.Context, from time.Time, fn func(Group) error) error {
+	params := group.ListParams{Limit: ucare.Uint64(PageSize), OrderBy: ucare.String(group.OrderByCreatedAtAsc)}
+	if !from.IsZero() {
+		from = from.UTC()
+		params.StartingFrom = &from
+	}
+	list, err := c.groups.List(ctx, params)
+	if err != nil {
+		return err
+	}
+	for list.Next() {
+		info, err := list.ReadResult()
+		if err != nil {
+			return err
+		}
+		g := Group{ID: info.ID}
+		if info.CreatedAt != nil {
+			g.CreatedAt = info.CreatedAt.UTC()
+		}
+		if err := fn(g); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// GroupInfo reads a group with its members from GET /groups/{id}/.
+// uploadcare-go's group.Info leaves out the files, so the request goes
+// through the client directly.
+func (c *Client) GroupInfo(ctx context.Context, id string) (Group, error) {
+	req, err := c.uc.NewRequest(ctx, restHost, http.MethodGet, "/groups/"+id+"/", nil)
+	if err != nil {
+		return Group{}, err
+	}
+	var res struct {
+		ID        string       `json:"id"`
+		CreatedAt time.Time    `json:"datetime_created"`
+		Files     []*file.Info `json:"files"`
+	}
+	if err := c.uc.Do(req, &res); err != nil {
+		return Group{}, err
+	}
+	g := Group{ID: res.ID, CreatedAt: res.CreatedAt.UTC(), Members: make([]*File, len(res.Files))}
+	for i, info := range res.Files {
+		if info != nil {
+			f := fromInfo(info)
+			g.Members[i] = &f
+		}
+	}
+	return g, nil
 }
 
 // IsNotFound reports a REST 404.

@@ -68,10 +68,11 @@ func TestMountListReadAndReject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The mount point, its files, tree, .ucfs and .metadata_never_index,
-	// the files in files/ and in tree/_inbox, tree/_inbox itself and the
-	// journal.
-	if count != 1+4+2*len(files)+1+1 {
+	// The mount point, its files, tree, by-date, .ucfs and
+	// .metadata_never_index, the files in files/ and in tree/_inbox,
+	// tree/_inbox itself, the journal, and by-date's year, month and day
+	// with the files.
+	if count != 1+5+2*len(files)+1+1+3+len(files) {
 		t.Errorf("walked %d entries", count)
 	}
 	if reqs, _ := env.Fake.CDNStats(); reqs != 0 {

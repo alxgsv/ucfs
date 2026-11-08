@@ -4,6 +4,7 @@ package fake
 
 import (
 	"bytes"
+	"crypto/md5"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -16,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -62,6 +64,8 @@ type Server struct {
 	cdnBytes    int64
 	variantsGen int
 	up          uploads
+	groups      []Group
+	noTags      atomic.Bool
 }
 
 func New(t testing.TB) *Server {
@@ -70,8 +74,17 @@ func New(t testing.TB) *Server {
 	rest.HandleFunc("GET /files/", s.listFiles)
 	rest.HandleFunc("GET /files/{uuid}/", s.fileInfo)
 	rest.HandleFunc("DELETE /files/{uuid}/storage/", s.deleteStorage)
+	rest.HandleFunc("GET /files/{uuid}/metadata/", s.getMetadata)
+	rest.HandleFunc("GET /files/{uuid}/metadata/{key}/", s.getMetadataKey)
 	rest.HandleFunc("PUT /files/{uuid}/metadata/{key}/", s.putMetadata)
 	rest.HandleFunc("DELETE /files/{uuid}/metadata/{key}/", s.deleteMetadata)
+	rest.HandleFunc("GET /files/{uuid}/tags/", s.getTags)
+	rest.HandleFunc("PUT /files/{uuid}/tags/", s.putTags)
+	rest.HandleFunc("POST /files/search/", s.search)
+	rest.HandleFunc("GET /groups/", s.listGroups)
+	rest.HandleFunc("GET /groups/{id}/", s.groupInfo)
+	rest.HandleFunc("DELETE /groups/{id}/", s.deleteGroup)
+	rest.HandleFunc("POST /group/", s.createGroup)
 	rest.HandleFunc("POST /base/", s.baseUpload)
 	rest.HandleFunc("POST /multipart/start/", s.multipartStart)
 	rest.HandleFunc("PUT /part/{uuid}/{n}", s.putPart)
@@ -185,7 +198,7 @@ func (s *Server) fileInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write(fileJSON(f))
+	_, _ = w.Write(s.fileJSON(f))
 }
 
 func (s *Server) serveCDN(w http.ResponseWriter, r *http.Request) {
@@ -215,7 +228,9 @@ func (s *Server) serveCDN(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprintf(cw, "<html><head><title>400: Bad Request</title></head><body><h3>Bad Request</h3>\n"+
 			"<p>Cannot parse url part: %s</p>\n<p>See <a href=\"https://uploadcare.com/docs/\">CDN documentation</a>.</p></body></html>", BadArg)
 	case ops == "":
-		http.ServeContent(cw, r, "", f.Uploaded, bytes.NewReader(s.content(f)))
+		body := s.content(f)
+		cw.Header().Set("ETag", fmt.Sprintf(`"%x"`, md5.Sum(body)))
+		http.ServeContent(cw, r, "", f.Uploaded, bytes.NewReader(body))
 	default:
 		body, etag, mime := variant(f, ops, gen)
 		cw.Header().Set("ETag", etag)
@@ -335,7 +350,7 @@ func (s *Server) listFiles(w http.ResponseWriter, r *http.Request) {
 		Results []json.RawMessage `json:"results"`
 	}{PerPage: limit, Results: []json.RawMessage{}}
 	for _, f := range page {
-		resp.Results = append(resp.Results, fileJSON(f))
+		resp.Results = append(resp.Results, s.fileJSON(f))
 	}
 	if more {
 		next := url.Values{}
@@ -353,7 +368,7 @@ func (s *Server) listFiles(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-func fileJSON(f File) json.RawMessage {
+func (s *Server) fileJSON(f File) json.RawMessage {
 	ts := func(t time.Time) *string {
 		if t.IsZero() {
 			return nil
@@ -376,12 +391,7 @@ func fileJSON(f File) json.RawMessage {
 	if meta == nil {
 		meta = map[string]string{}
 	}
-	tags := f.Tags
-	if tags == nil {
-		tags = []string{}
-	}
-	b, _ := json.Marshal(map[string]any{
-		"tags":              tags,
+	info := map[string]any{
 		"uuid":              f.UUID,
 		"original_filename": f.Name,
 		"size":              f.Size,
@@ -394,6 +404,14 @@ func fileJSON(f File) json.RawMessage {
 		"content_info":      contentInfo,
 		"metadata":          meta,
 		"url":               fmt.Sprintf("https://%s/files/%s/", restHost, f.UUID),
-	})
+	}
+	if !s.noTags.Load() {
+		tags := f.Tags
+		if tags == nil {
+			tags = []string{}
+		}
+		info["tags"] = tags
+	}
+	b, _ := json.Marshal(info)
 	return b
 }

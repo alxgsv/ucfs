@@ -22,6 +22,7 @@ type REST interface {
 	DeleteStorage(ctx context.Context, uuid string) error
 	SetMetadata(ctx context.Context, uuid, key, value string) error
 	DeleteMetadata(ctx context.Context, uuid, key string) error
+	SetTags(ctx context.Context, uuid string, tags []string) ([]string, error)
 }
 
 // Writes makes a mount writable.
@@ -361,7 +362,7 @@ func (f *FS) Flush(ctx context.Context, n Node) error {
 // shadow file. Files outside tree/ that the mount did not write need
 // Foreign.
 func (f *FS) Remove(ctx context.Context, dir Node, name string) error {
-	if f.w == nil {
+	if f.w == nil || dir.Kind == KindViewDir {
 		return syscall.EROFS
 	}
 	e, err := f.Lookup(ctx, dir, name)
@@ -480,6 +481,9 @@ func (f *FS) Rmdir(ctx context.Context, dir Node, name string) error {
 	if !e.Node.IsDir() {
 		return syscall.ENOTDIR
 	}
+	if e.Node.Kind == KindViewDir {
+		return syscall.EROFS
+	}
 	if e.Node.Kind != KindTreeDir && e.Node.Kind != KindShadowDir {
 		return syscall.EPERM
 	}
@@ -507,7 +511,7 @@ func (f *FS) Rmdir(ctx context.Context, dir Node, name string) error {
 // becomes a spool and is uploaded: that is how a safe save that wrote into
 // a scratch directory lands.
 func (f *FS) Rename(ctx context.Context, dir Node, name string, newDir Node, newName string) error {
-	if f.w == nil {
+	if f.w == nil || dir.Kind == KindViewDir || newDir.Kind == KindViewDir {
 		return syscall.EROFS
 	}
 	src, err := f.Lookup(ctx, dir, name)

@@ -2,7 +2,10 @@ package spool
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"errors"
+	"io"
 	"log/slog"
 	"mime"
 	"net/http"
@@ -122,9 +125,10 @@ func (m *Manager) discard(uuid string) {
 }
 
 // prepare builds the upload of a spool: its written name, the metadata of
-// the file it replaces with the configured metadata and its tree path on
-// top, and the replaced file's tags. The replaced file's metadata comes from
-// the API: listings do not show changes other clients made after a file was
+// the file it replaces with the configured metadata, the metadata queued
+// on the spool and its tree path on top, and the replaced file's tags
+// unless tags were queued. The replaced file's metadata comes from the
+// API: listings do not show changes other clients made after a file was
 // first listed, so the index may hold old values.
 func (m *Manager) prepare(ctx context.Context, s *Spool) api.Upload {
 	meta := map[string]string{}
@@ -138,6 +142,12 @@ func (m *Manager) prepare(ctx context.Context, s *Spool) api.Upload {
 	}
 	for k, v := range m.o.Metadata {
 		meta[k] = v
+	}
+	for k, v := range s.row.Queued.Meta {
+		meta[k] = v
+	}
+	if q := s.row.Queued.Tags; q != nil {
+		tags = *q
 	}
 	delete(meta, index.TreePathKey)
 	if tp := TreePath(s.row.Path); tp != "" {
@@ -201,6 +211,14 @@ func (m *Manager) finish(ctx context.Context, s *Spool, u api.Upload, res api.Up
 		UploadedAt: now, StoredAt: now, Metadata: u.Metadata, Tags: u.Tags}
 	if err := m.ix.PutUploaded(ctx, f); err != nil {
 		slog.Warn("record upload", "uuid", res.UUID, "err", err)
+	}
+	// The CDN's ETag of a multipart upload is not the content's MD5.
+	sum := md5.New()
+	if _, err := io.Copy(sum, io.NewSectionReader(s.f, 0, u.Size)); err == nil {
+		err = m.ix.SetMD5(ctx, res.UUID, hex.EncodeToString(sum.Sum(nil)))
+		if err != nil {
+			slog.Warn("record md5", "uuid", res.UUID, "err", err)
+		}
 	}
 	if r.Replaces != "" && r.Replaces != res.UUID {
 		m.replaced(ctx, r.Replaces, res.UUID)

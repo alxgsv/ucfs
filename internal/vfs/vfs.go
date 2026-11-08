@@ -57,13 +57,22 @@ const (
 	// KindNeverIndex is .metadata_never_index at the root, which keeps
 	// Spotlight away.
 	KindNeverIndex
+	// KindViewDir is a directory of the by-date, tags or groups view, known
+	// by its mount path: "by-date/2026/11", "tags/approved", "groups".
+	KindViewDir
+	// KindDateFile is a file in by-date/YYYY/MM/DD/, whose place follows
+	// from its upload time.
+	KindDateFile
+	// KindViewFile is a file in tags/<tag>/ or groups/<id>/, known by its
+	// mount path, which says which tag or group it was found through.
+	KindViewFile
 )
 
 // HasUUID reports whether NFS handles of this kind carry a uuid. A tree
 // file's is the key of its object, which may be empty.
 func (k Kind) HasUUID() bool {
 	switch k {
-	case KindFile, KindFileDir, KindVariantDir, KindVariant, KindTreeFile:
+	case KindFile, KindFileDir, KindVariantDir, KindVariant, KindTreeFile, KindDateFile, KindViewFile:
 		return true
 	}
 	return false
@@ -73,7 +82,7 @@ func (k Kind) HasUUID() bool {
 // the index keeps by node id for NFS handles (FS.Remember).
 func (k Kind) ByPath() bool {
 	switch k {
-	case KindVariantDir, KindVariant, KindTreeDir, KindShadowDir:
+	case KindVariantDir, KindVariant, KindTreeDir, KindShadowDir, KindViewDir, KindViewFile:
 		return true
 	}
 	return false
@@ -132,13 +141,19 @@ func (n Node) ID() uint64 {
 		_, _ = h.Write([]byte(UcfsDir + "/" + JournalName))
 	case KindNeverIndex:
 		_, _ = h.Write([]byte(NeverIndex))
+	case KindViewDir:
+		_, _ = h.Write([]byte("view\x00" + n.Ops))
+	case KindDateFile:
+		_, _ = h.Write([]byte(ViewByDate + "\x00" + n.UUID))
+	case KindViewFile:
+		_, _ = h.Write([]byte("view\x00" + n.Ops + "\x00" + n.UUID))
 	}
 	return h.Sum64()
 }
 
 func (n Node) IsDir() bool {
 	switch n.Kind {
-	case KindFile, KindVariant, KindTreeFile, KindShadow, KindJournal, KindNeverIndex:
+	case KindFile, KindVariant, KindTreeFile, KindShadow, KindJournal, KindNeverIndex, KindDateFile, KindViewFile:
 		return false
 	}
 	return true
@@ -197,6 +212,13 @@ type FS struct {
 	failed map[string]failure
 	// nodeOps holds the operations paths of node ids already in the index.
 	nodeOps map[uint64]string
+
+	views map[string]bool
+	opts  Options
+	stats metaStats
+	// refreshes, md5s and groupFetch share one request among concurrent
+	// readers of the same file or group.
+	refreshes, md5s, groupFetch singleflight.Group
 }
 
 // New builds the filesystem. missing is called, in its own goroutine, when
@@ -204,6 +226,7 @@ type FS struct {
 func New(ix *index.Index, c *cache.Cache, head Header, missing func(uuid string)) *FS {
 	f := &FS{ix: ix, cache: c, cdn: head, now: time.Now, missing: missing,
 		failed: map[string]failure{}, nodeOps: map[uint64]string{}}
+	f.Configure(Options{})
 	f.Touch()
 	return f
 }
@@ -284,6 +307,18 @@ func (f *FS) Getattr(ctx context.Context, n Node) (Attr, error) {
 		return f.journalAttr(), nil
 	case KindNeverIndex:
 		return Attr{Mode: 0o444, Mtime: time.Unix(0, 0), TTL: fileTTL}, nil
+	case KindViewDir:
+		return f.viewDirAttr(ctx, n.Ops)
+	case KindDateFile, KindViewFile:
+		file, err := f.file(ctx, n.UUID)
+		if err != nil {
+			return Attr{}, err
+		}
+		a := fileAttr(file)
+		if n.Kind == KindViewFile {
+			a.TTL = dirTTL
+		}
+		return a, nil
 	}
 	return Attr{}, syscall.ENOENT
 }
@@ -309,11 +344,10 @@ func (f *FS) file(ctx context.Context, uuid string) (index.File, error) {
 func (f *FS) Lookup(ctx context.Context, dir Node, name string) (Entry, error) {
 	switch dir.Kind {
 	case KindRoot:
+		if e, ok := f.rootView(name); ok {
+			return e, nil
+		}
 		switch {
-		case name == FilesDir:
-			return Entry{Name: name, Node: Node{Kind: KindFilesDir}, Attr: f.writableDirAttr(dirTTL)}, nil
-		case name == TreeDir:
-			return Entry{Name: name, Node: Node{Kind: KindTreeDir, Ops: "/"}, Attr: f.writableDirAttr(dirTTL)}, nil
 		case name == UcfsDir:
 			return Entry{Name: name, Node: Node{Kind: KindUcfsDir}, Attr: f.dirAttr(dirTTL)}, nil
 		case name == NeverIndex:
@@ -354,7 +388,9 @@ func (f *FS) Lookup(ctx context.Context, dir Node, name string) (Entry, error) {
 			n := Node{Kind: KindJournal}
 			return Entry{Name: name, Node: n, Attr: f.journalAttr()}, nil
 		}
-	case KindFile, KindVariant, KindTreeFile, KindShadow, KindJournal, KindNeverIndex:
+	case KindViewDir:
+		return f.lookupView(ctx, dir.Ops, name)
+	case KindFile, KindVariant, KindTreeFile, KindShadow, KindJournal, KindNeverIndex, KindDateFile, KindViewFile:
 		return Entry{}, syscall.ENOTDIR
 	}
 	return Entry{}, syscall.ENOENT
@@ -363,13 +399,13 @@ func (f *FS) Lookup(ctx context.Context, dir Node, name string) (Entry, error) {
 func (f *FS) ReadDir(ctx context.Context, dir Node) ([]Entry, error) {
 	switch dir.Kind {
 	case KindRoot:
-		never, _ := f.Lookup(ctx, dir, NeverIndex)
-		out := []Entry{
-			{Name: FilesDir, Node: Node{Kind: KindFilesDir}, Attr: f.writableDirAttr(dirTTL)},
-			{Name: TreeDir, Node: Node{Kind: KindTreeDir, Ops: "/"}, Attr: f.writableDirAttr(dirTTL)},
-			{Name: UcfsDir, Node: Node{Kind: KindUcfsDir}, Attr: f.dirAttr(dirTTL)},
-			never,
+		var out []Entry
+		for _, v := range f.Views() {
+			e, _ := f.rootView(v)
+			out = append(out, e)
 		}
+		never, _ := f.Lookup(ctx, dir, NeverIndex)
+		out = append(out, Entry{Name: UcfsDir, Node: Node{Kind: KindUcfsDir}, Attr: f.dirAttr(dirTTL)}, never)
 		return f.withShadows(ctx, "", out)
 	case KindFilesDir:
 		files, err := f.ix.Files(ctx)
@@ -402,7 +438,9 @@ func (f *FS) ReadDir(ctx context.Context, dir Node) ([]Entry, error) {
 		return f.withShadows(ctx, dir.Ops, nil)
 	case KindUcfsDir:
 		return []Entry{{Name: JournalName, Node: Node{Kind: KindJournal}, Attr: f.journalAttr()}}, nil
-	case KindFile, KindVariant, KindTreeFile, KindShadow, KindJournal, KindNeverIndex:
+	case KindViewDir:
+		return f.readView(ctx, dir.Ops)
+	case KindFile, KindVariant, KindTreeFile, KindShadow, KindJournal, KindNeverIndex, KindDateFile, KindViewFile:
 		return nil, syscall.ENOTDIR
 	}
 	return nil, syscall.ENOENT
@@ -530,6 +568,19 @@ func (f *FS) Path(ctx context.Context, n Node) ([]string, error) {
 		return []string{UcfsDir, JournalName}, nil
 	case KindNeverIndex:
 		return []string{NeverIndex}, nil
+	case KindViewDir:
+		return split(n.Ops), nil
+	case KindDateFile:
+		file, err := f.file(ctx, n.UUID)
+		if err != nil {
+			return nil, err
+		}
+		return f.datePath(file), nil
+	case KindViewFile:
+		if _, err := f.file(ctx, n.UUID); err != nil {
+			return nil, err
+		}
+		return split(n.Ops), nil
 	}
 	return nil, syscall.ENOENT
 }

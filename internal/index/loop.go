@@ -16,12 +16,15 @@ type Source interface {
 }
 
 // Loop keeps a mounted index current: incremental listing every Interval,
-// a removed sweep every SweepEvery, and refreshes after CDN 404s.
+// a removed sweep and a group sync every SweepEvery, and refreshes after
+// CDN 404s.
 type Loop struct {
 	Index      *Index
 	Source     Source
 	Interval   time.Duration
 	SweepEvery time.Duration
+	// Groups, when set, lists new groups with every sweep.
+	Groups GroupLister
 	// Changed runs after any update that changed the index.
 	Changed func()
 
@@ -50,6 +53,11 @@ func (l *Loop) Run(ctx context.Context) {
 			lastSweep = time.Now()
 			changed = changed || n > 0
 			slog.Debug("removed sweep", "marked", n, "err", err)
+			if err == nil && l.Groups != nil {
+				n, err = l.Index.SyncGroups(ctx, l.Groups)
+				changed = changed || n > 0
+				slog.Debug("group sync", "added", n, "err", err)
+			}
 		}
 		l.record(err)
 		if err != nil && ctx.Err() == nil {
@@ -83,7 +91,7 @@ func (l *Loop) Refresh(ctx context.Context, uuid string) {
 	case api.IsNotFound(err):
 		_, err = l.Index.db.ExecContext(ctx, `UPDATE files SET removed = 1, removed_at = ? WHERE uuid = ?`, time.Now().Unix(), uuid)
 	case err == nil:
-		err = l.Index.Put(ctx, f)
+		err = l.Index.PutInfo(ctx, time.Now(), f)
 	}
 	if err != nil {
 		slog.Warn("refresh after CDN 404", "uuid", uuid, "err", err)
