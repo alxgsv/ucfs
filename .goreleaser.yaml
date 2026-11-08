@@ -52,8 +52,8 @@ release:
   prerelease: auto
 
 # A formula, not a cask: a formula has a test block and the binary gets no
-# quarantine attribute. goreleaser deprecates brews for homebrew_casks, and
-# from about 2.15 `goreleaser check` exits 2 on it; releases still publish it.
+# quarantine attribute. goreleaser deprecates brews for homebrew_casks:
+# `goreleaser check` warns on 2.14 and exits 2 on 2.20; releases still publish it.
 brews:
   - name: ucfs
     repository:

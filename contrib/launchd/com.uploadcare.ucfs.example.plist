@@ -25,6 +25,11 @@
 	</dict>
 	<key>ThrottleInterval</key>
 	<integer>30</integer>
+	<!-- After SIGTERM the daemon uploads what is still being written for up to
+	     2 minutes, but launchd sends SIGKILL after ExitTimeOut, which it caps
+	     at 60 seconds for an agent; the next mount uploads what was cut off. -->
+	<key>ExitTimeOut</key>
+	<integer>60</integer>
 	<key>StandardOutPath</key>
 	<string>/Users/YOU/Library/Logs/ucfs.log</string>
 	<key>StandardErrorPath</key>

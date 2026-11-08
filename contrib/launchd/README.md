@@ -37,4 +37,5 @@ launchctl bootout gui/$(id -u)/com.uploadcare.ucfs
 rm ~/Library/LaunchAgents/com.uploadcare.ucfs.plist
 ```
 
-`bootout` stops the daemon with SIGTERM, which unmounts.
+`bootout` stops the daemon with SIGTERM, which unmounts. launchd waits at most 60 seconds for it to finish uploading
+what was being written, then kills it; the next mount uploads the rest.
