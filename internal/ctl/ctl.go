@@ -48,18 +48,34 @@ type CacheStatus struct {
 	Max             int64 `json:"max"`
 }
 
-// SocketPath is the control socket of a mount. It lives in the project's
-// cache dir and is named after the mount point, kept short for the 104-byte
-// sun_path limit on macOS.
-func SocketPath(cacheDir, mountDir string) string {
+// maxSocketPath is sun_path on macOS (104 bytes) minus the trailing NUL.
+const maxSocketPath = 103
+
+func hash32(s string) uint32 {
 	h := fnv.New32a()
-	_, _ = h.Write([]byte(mountDir))
-	return filepath.Join(cacheDir, fmt.Sprintf("ctl-%08x.sock", h.Sum32()))
+	_, _ = h.Write([]byte(s))
+	return h.Sum32()
 }
 
-// Sockets lists the control sockets in a cache dir.
+// SocketPath is the control socket of a mount: in the project's cache dir,
+// named after the mount point, or under the temp dir when that path would
+// not fit in sun_path.
+func SocketPath(cacheDir, mountDir string) string {
+	p := filepath.Join(cacheDir, fmt.Sprintf("ctl-%08x.sock", hash32(mountDir)))
+	if len(p) <= maxSocketPath {
+		return p
+	}
+	return filepath.Join(os.TempDir(), fmt.Sprintf("ucfs-%08x-%08x.sock", hash32(cacheDir), hash32(mountDir)))
+}
+
+// Sockets lists the control sockets of mounts that use a cache dir.
 func Sockets(cacheDir string) ([]string, error) {
-	return filepath.Glob(filepath.Join(cacheDir, "ctl-*.sock"))
+	inCache, err := filepath.Glob(filepath.Join(cacheDir, "ctl-*.sock"))
+	if err != nil {
+		return nil, err
+	}
+	inTemp, err := filepath.Glob(filepath.Join(os.TempDir(), fmt.Sprintf("ucfs-%08x-*.sock", hash32(cacheDir))))
+	return append(inCache, inTemp...), err
 }
 
 type Server struct {
