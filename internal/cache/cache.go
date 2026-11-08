@@ -26,10 +26,13 @@ import (
 
 const BlockSize = 1 << 20
 
-// Key names one object: an original (Ops empty) or a CDN variant.
+// Key names one object: an original (Ops empty) or a CDN variant. Version
+// tells apart contents a variant had over time, such as its ETag; it only
+// changes where blocks are stored, never what is fetched.
 type Key struct {
-	UUID string
-	Ops  string
+	UUID    string
+	Ops     string
+	Version string
 }
 
 // Fetcher reads object bytes; cdn.Client implements it.
@@ -134,11 +137,11 @@ func (c *Cache) scan() error {
 }
 
 func objName(k Key) string {
-	if k.Ops == "" {
+	if k.Ops == "" && k.Version == "" {
 		return k.UUID
 	}
 	h := fnv.New64a()
-	_, _ = h.Write([]byte(k.Ops))
+	_, _ = h.Write([]byte(k.Ops + "\x00" + k.Version))
 	return fmt.Sprintf("%s~%016x", k.UUID, h.Sum64())
 }
 
@@ -393,6 +396,24 @@ func (c *Cache) Forget(k Key) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.streams, k)
+}
+
+// Drop removes an object's blocks and streams, for a variant whose content
+// changed.
+func (c *Cache) Drop(k Key) {
+	obj := objName(k)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.streams, k)
+	for id, el := range c.blocks {
+		if id.obj != obj {
+			continue
+		}
+		c.lru.Remove(el)
+		delete(c.blocks, id)
+		c.used -= el.Value.(*blockEntry).size
+		_ = os.Remove(c.path(id))
+	}
 }
 
 type Stats struct {
