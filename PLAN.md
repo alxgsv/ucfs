@@ -43,7 +43,7 @@ internal/index/                SQLite schema and migrations, full scan, incremen
 internal/cache/                on-disk block cache, LRU eviction, singleflight, sequential detector, adaptive prefetch, traffic accounting
 internal/spool/                write spool, commit triggers, upload, overwrite policy, aliases, upload journal, crash recovery
 internal/vfs/                  platform-neutral filesystem model: node ids, attrs, lookup/readdir/open/read/write/flush, xattrs, local-only shadow files
-internal/vfs/views/            files, variants, tree, bydate, tags, groups (one file each; files, variants and tree are vfs.go, variants.go and tree.go in internal/vfs so far, writes write.go, shadow files shadow.go)
+internal/vfs/views/            files, variants, tree, bydate, tags, groups (planned as one file each; built in internal/vfs as vfs.go, variants.go, tree.go and views.go for by-date, tags and groups, with writes in write.go, shadow files in shadow.go and xattrs in xattr.go)
 internal/frontend/nfs/         go-nfs Handler (stable file handles), billy.Filesystem adapter, mount_nfs/umount driver (darwin, linux)
 internal/frontend/fuse/        go-fuse adapter (linux build tag)
 internal/ctl/                  unix-socket control API used by `ucfs status`
@@ -205,16 +205,60 @@ upload resumed and the file arrived once on both hosts; a 12.2 MB file went up i
 
 ### Phase 4: Metadata, tags, groups, dates (≈ 3 days)
 
-28. xattrs on Linux FUSE: read-only `user.uc.uuid`, `.cdn_url`, `.mime`, `.md5`, `.width`, `.height`, `.stored`,
-    `.tags`; read-write `user.uc.meta.<key>` → metadata API (50-key, 64/512-char limits mapped to `E2BIG`/`ENOSPC`).
-29. `views/tags` (`tags/<tag>/<uuid>_<name>`), `views/groups` (`groups/<group-uuid>/<index>_<name>`),
-    `views/bydate` (`by-date/YYYY/MM/DD/<uuid>_<name>`); group sync via `GET /groups/` cursor.
-30. `ucfs resolve <path>` also prints metadata (uuid, CDN URL and pending state came in Phase 3).
-31. Lazy metadata refresh: `getxattr` re-fetches file info when the index entry is older than 5 min.
-32. `--views` flag selects which views are mounted (default `files,tree,by-date`; `tags` and `groups` opt-in).
+28. xattrs on Linux FUSE (`internal/vfs/xattr.go`, go-fuse `Getxattr`/`Listxattr`/`Setxattr`/`Removexattr`): read-only
+    `user.uc.uuid`, `.cdn_url` (with the operations path for a variant), `.mime`, `.md5`, `.width`, `.height` (images
+    only), `.stored` (`true`/`false`); read-write `user.uc.meta.<key>` (one metadata `PUT`, `removexattr` one `DELETE`)
+    and `user.uc.tags`, comma-separated as the Upload API's `tags` field (a tag cannot hold a comma), written with one
+    `PUT /files/{uuid}/tags/` that replaces the list; the API's normalised answer goes to the index. Every successful
+    write updates the index at once. Limits: a key over 64 characters is `ENAMETOOLONG`, other than `[\w\-\.\:]+` or an
+    empty or non-UTF-8 value `EINVAL` (the API routes such keys to a 404 page and refuses empty values), a value over
+    512 characters (the API counts characters, not bytes) `E2BIG`, a tag over 100 characters `ENAMETOOLONG`, a 51st key
+    or tag `ENOSPC` (the 50-key limit is the API's 400, which `internal/api` maps by message, since the index may not
+    know keys other clients added). `user.uc.meta.ucfs:path` is `EPERM`: `mv` moves files, and keeps foreign files out
+    of reach without `--allow-foreign`. Other read-only names are `EPERM`, names outside `user.uc.*` `ENOTSUP` on set
+    and `ENODATA` on get without any lookup (go-fuse answers `security.capability`, which the kernel asks before every
+    write). `XATTR_CREATE`/`XATTR_REPLACE` are honoured; `removexattr` of a missing key is `ENODATA`, decided from the
+    file's current info because the API answers `DELETE` of a missing key with 204. `md5` is the CDN's ETag, one `HEAD`
+    on first read and kept; for multipart uploads that ETag is S3's hash of part hashes (`…-3`), so uploads record their
+    MD5 from the spool, and other files list `md5` only when known or under 10 MiB, the multipart minimum. A file still
+    being written lists `user.uc.uuid` with an empty value and queues `setxattr` of metadata and tags into its upload
+    form (persisted with the spool, `EAGAIN` while the upload is in flight), so `cp --preserve=xattr` into the mount
+    carries metadata. Read-only attributes set or removed on such a file, or on one the mount uploaded within the last
+    minute (rsync sets attributes after closing, which uploads), are ignored, so `cp --preserve=xattr` and `rsync -X`
+    of files from the mount succeed. xattrs on files in every view change the file's metadata; a `--read-only` mount is
+    `EROFS`.
+29. Views (`internal/vfs/views.go`), all read-only (`EROFS` on create, write, `rm`, `mkdir`, `mv` in or out):
+    `by-date/YYYY/MM/DD/<uuid>_<name>` from `datetime_uploaded` in `--by-date-zone` (default the local zone), each
+    year, month or day found with one index probe; `tags/<tag>/<uuid>_<name>`, where `tags/` lists every tag a present
+    file in the index carries (`json_each` over the `tags` column; `.` and `..` skipped); `groups/<id>/<index>_<name>`,
+    where `<id>` is the group id `<uuid>~<count>` and the index counts from 0 as the CDN's `/nth/` does, zero-padded to
+    the width of the last index so `ls` order is group order, keeping gaps for removed members. Group sync lists
+    `GET /groups/` from a cursor with every sweep (`--sweep-interval`, 10 min) when the view is mounted; a group's
+    members come from `GET /groups/{id}/` on its first listing (uploadcare-go's `group.Info` has no files, so the client
+    sends that request itself) and are kept, since groups never change; a group id not synced yet is read on lookup, and
+    a 404 drops it. A deleted group whose members were already read stays listed: the API lists no deleted groups. View nodes have NFS handles like variants: directories and `tags/`/`groups/` files by path through
+    `node_ops`, `by-date/` files by uuid alone.
+30. `ucfs resolve <path> [--json]` prints metadata and tags too, plus the CDN URL (uuid, CDN URL and pending state came
+    in Phase 3); for a pending upload it shows what was queued on it. It refreshes info older than `--meta-ttl` like an
+    xattr read, so macOS, which has no xattrs over NFSv3, sees other clients' changes the same way.
+31. Lazy metadata refresh: `getxattr` and `ucfs resolve` re-fetch file info (`GET /files/{uuid}/`, recorded without
+    moving the sync cursor) when the index entry is older than `--meta-ttl` (5 min); concurrent readers share one
+    request, a failed refresh serves the index's copy, and a file found removed is `ENOENT`. `listxattr` never refreshes:
+    coreutils' `ls -l` lists the attributes of every file. `ucfs status` counts refreshes, xattr calls, md5 `HEAD`s and
+    group reads.
+32. `--views` selects the mounted views (default `files,tree,by-date`; `tags` and `groups` opt-in), and the root
+    listing shows only those; an unknown name is an error at mount.
 
 Acceptance: `setfattr -n user.uc.meta.camera -v Canon tree/x.jpg` is visible in the dashboard; `tags/approved/` lists
 exactly the search result for `tags.all=[approved]`.
+Measured in [docs/phase4.md](docs/phase4.md) against `alex-gusev-test`: on Linux the `setfattr` is one metadata `PUT`
+(0.21–0.29 s) that the API and `uploadcare metadata list` show, `getfattr -d` matches the API and the file (md5 equal to
+`md5sum`), `setfattr -x` deletes the key, and `tags/p4-approved/` lists the same four files as the search API once its
+asynchronous index settles; `groups/<id>/` lists a group in creation order for one request; `ls -lR by-date/` costs 0 CDN
+bytes and 0 REST requests on both hosts; `getfattr -d` costs 1 REST request (0.21 s) on an entry past the TTL and none
+(7–8 ms) within it, and a CLI change shows by `getfattr` on Linux and `ucfs resolve` on macOS once the entry is a TTL
+old. Measuring found that a multipart upload's ETag is no MD5 and that `cp --preserve=xattr` and `rsync -X` failed on
+the read-only attributes; both are fixed.
 
 ### Phase 5: Hardening (≈ 3 days)
 
@@ -250,20 +294,24 @@ Result: `brew install alxgsv/tap/ucfs && ucfs mount ~/uc` on a fresh Mac (tap na
 ```sql
 files     (uuid TEXT PRIMARY KEY, name TEXT, size INTEGER, mime TEXT, is_image INTEGER, is_ready INTEGER,
            stored INTEGER, removed INTEGER, uploaded_at INTEGER, stored_at INTEGER, removed_at INTEGER,
-           md5 TEXT, width INTEGER, height INTEGER, metadata TEXT /*json*/, tags TEXT /*json*/,
-           tree_path TEXT, info_refreshed_at INTEGER,
+           md5 TEXT, width INTEGER, height INTEGER, metadata TEXT /*json*/, tags TEXT /*json, null without the feature*/,
+           tree_path TEXT, info_refreshed_at INTEGER,  -- md5 from an upload or the CDN's ETag, kept by listings;
+           -- info_refreshed_at is when the row last came from the API, which the metadata TTL is measured from (Phase 4)
            tree_dir TEXT, tree_key TEXT, name_key TEXT);  -- NFC keys of a valid ucfs:path and of the name (Phase 3)
            -- indexes: uploaded_at, name, tree_path, removed, (tree_dir, tree_key), name_key
 variants  (uuid TEXT, ops TEXT, size INTEGER, mime TEXT, etag TEXT, checked_at INTEGER, changed_at INTEGER,
            PRIMARY KEY (uuid, ops));                -- changed_at: first HEAD with this size and ETag (Phase 2)
 node_ops  (id INTEGER PRIMARY KEY, uuid TEXT, ops TEXT);  -- operations path behind a variants view node id (Phase 2)
-groups    (uuid TEXT PRIMARY KEY, created_at INTEGER, files TEXT /*json array of uuids*/);
+groups    (uuid TEXT PRIMARY KEY, created_at INTEGER, files TEXT);  -- uuid is the group id <uuid>~<count>, created_at
+           -- in ns (to the second, as uploadcare-go reads it); files is a JSON array of member uuids, "" for a removed
+           -- member, NULL until the group's info was read (Phase 4)
 aliases   (view TEXT, name TEXT, uuid TEXT, expires_at INTEGER, PRIMARY KEY (view, name));  -- index on uuid
 tree_dirs (path TEXT PRIMARY KEY, created_at INTEGER);  -- tree directories kept while empty, local only
 shadow    (path TEXT PRIMARY KEY, blob_ref TEXT, size INTEGER, mtime INTEGER, ino INTEGER UNIQUE, dir INTEGER);
 objects   (ino INTEGER PRIMARY KEY, uuid TEXT UNIQUE, key TEXT);  -- inode number of a file the mount wrote (Phase 3)
 spools    (id TEXT PRIMARY KEY, ino INTEGER, key TEXT, path TEXT, state TEXT, replaces TEXT, upload_uuid TEXT,
-           created_at INTEGER, committed_at INTEGER, attempts INTEGER, error TEXT);  -- writes not uploaded yet
+           created_at INTEGER, committed_at INTEGER, attempts INTEGER, error TEXT,
+           queued TEXT);  -- writes not uploaded yet; queued: JSON of metadata and tags set before the upload (Phase 4)
 sync_state(key TEXT PRIMARY KEY, value TEXT);  -- list cursor, last full scan, last removed sweep, groups cursor
 ```
 
@@ -273,9 +321,12 @@ sync_state(key TEXT PRIMARY KEY, value TEXT);  -- list cursor, last full scan, l
   last `datetime_uploaded` (re-fetch of equal timestamps is deduplicated by uuid).
 - Incremental: same call from the cursor every `--sync-interval` (default 30 s).
 - Removals: `removed=true` listing every 10 min marks `removed`; a CDN 404 on read does the same immediately.
-- Metadata and tags changed by other clients are not visible in listings: refreshed lazily on `getxattr` (5 min TTL)
-  and by `ucfs index refresh <uuid>`.
-- Groups: `GET /groups/?ordering=datetime_created&from=<cursor>` every 10 min.
+- Metadata and tags changed by other clients are not visible in listings: refreshed lazily on `getxattr` and
+  `ucfs resolve` when older than `--meta-ttl` (5 min), and by `ucfs index sync --full`; `ucfs index refresh <uuid>`
+  was not built. So `tags/` shows a tag set elsewhere on an already listed file only after such a refresh; tags set
+  through the mount (`user.uc.tags`, uploads) show at once.
+- Groups: `GET /groups/?ordering=datetime_created&from=<cursor>` with every removed sweep (10 min) when `groups/` is
+  mounted; members on first listing of a group.
 - Search API is used only by `ucfs resolve --search` and by tree repair, never on the request path.
 
 ### 4.3 Node ids and NFS file handles
@@ -346,9 +397,9 @@ resolve to `::1`. `nobrowse` keeps the mount out of the Finder sidebar; `rdonly`
 | `original_filename` mangling | Retired in 0 (Spike D) except names with `\` (base upload strips through the last `\` or `/`) | store the written name in `ucfs:name` metadata and display it; `EINVAL` until then |
 | Finder/Spotlight traffic | 0 (Spike C), 3, 5. Spotlight is off on NFS mounts by default; a Finder window read every visible test image in full on first visit (JPEGs without an embedded thumbnail, also with `readahead=0`; Quick Look caches thumbnails across mounts, docs/phase1.md), and `.ql_disablethumbnails` does not stop it | `nobrowse`, `rdonly`, `readahead=0`, shadow files, traffic counter and budget |
 | NFS has no close event | 3: macOS sends COMMIT, or a single stable WRITE for a small file, right after the data once go-nfs answers WRITE with `UNSTABLE`; the upload starts 300 ms later, and upload errors cannot reach the writer | 3 s idle commit; FUSE-T front-end in V1.1 for strict semantics |
-| No xattrs over NFSv3 on macOS | 4 | `ucfs resolve` and the CLI cover metadata on macOS until V1.1 |
+| No xattrs over NFSv3 on macOS | 4: `ucfs resolve [--json]` prints metadata and tags, refreshed after `--meta-ttl` | the CLI for writes; xattrs on macOS with the FUSE-T front-end in V1.1 |
 | go-nfs maturity ("minimally tested") | 1, 2, 5 (soak) | fork and fix, taken in Phase 2: `third_party/go-nfs` passes errnos through (LOOKUP could only fail with `NOENT`); offer the patch upstream. rclone uses the same library in production |
-| Stale index after foreign writes | 1, 4 | 30 s sync, lazy refresh, `ucfs index refresh` |
+| Stale index after foreign writes | 1, 4: metadata and tags refresh lazily on `getxattr` and `resolve` (`--meta-ttl`); `tags/` follows only refreshed files | 30 s sync, `ucfs index sync --full` |
 
 ## 7. Strategic notes
 
