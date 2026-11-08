@@ -357,7 +357,9 @@ func checkFlags(flags int, exists bool) error {
 // Setxattr sets user.uc.meta.<key> with one metadata PUT, or user.uc.tags
 // with one tags PUT, and records the result in the index. On a file not
 // uploaded yet the value goes into its upload form instead. Other user.uc.*
-// attributes are read-only.
+// attributes are read-only; on a file not uploaded yet they are ignored,
+// as its upload decides them, so that cp --preserve=xattr and rsync -X of
+// a file from the mount do not fail on them.
 func (f *FS) Setxattr(ctx context.Context, n Node, name string, value []byte, flags int) error {
 	if f.w == nil {
 		return syscall.EROFS
@@ -368,24 +370,23 @@ func (f *FS) Setxattr(ctx context.Context, n Node, name string, value []byte, fl
 	f.stats.sets.Add(1)
 	key, isMeta := strings.CutPrefix(name, XattrMeta)
 	var tags []string
+	var check error
 	switch {
 	case isMeta:
-		if err := checkKey(key); err != nil {
-			return err
-		}
-		if err := checkValue(value); err != nil {
-			return err
+		if check = checkKey(key); check == nil {
+			check = checkValue(value)
 		}
 	case name == XattrTags:
-		var err error
-		if tags, err = parseTags(value); err != nil {
-			return err
-		}
+		tags, check = parseTags(value)
 	default:
-		return syscall.EPERM
+		check = syscall.EPERM
 	}
 	t, ok, err := f.target(ctx, n)
 	switch {
+	case errors.Is(check, syscall.EPERM) && err == nil && t.spool != nil:
+		return nil
+	case check != nil:
+		return check
 	case err != nil:
 		return err
 	case !ok:

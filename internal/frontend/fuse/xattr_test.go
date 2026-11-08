@@ -129,8 +129,8 @@ func TestXattrs(t *testing.T) {
 			t.Fatalf("setxattr %s on the open file: %v", name, err)
 		}
 	}
-	if err := syscall.Setxattr(dst, vfs.XattrUUID, []byte(uuid(1)), 0); !errors.Is(err, syscall.EPERM) {
-		t.Errorf("copying user.uc.uuid = %v, want EPERM", err)
+	if err := syscall.Setxattr(dst, vfs.XattrUUID, []byte(uuid(1)), 0); err != nil {
+		t.Errorf("copying user.uc.uuid onto a pending file = %v, want it ignored", err)
 	}
 	if err := f.Close(); err != nil {
 		t.Fatal(err)

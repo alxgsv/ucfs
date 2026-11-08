@@ -329,6 +329,16 @@ func TestPendingXattrs(t *testing.T) {
 	if err := env.FS.Setxattr(ctx, e.Node, vfs.XattrMeta+"gone", []byte("v"), 0); err != nil {
 		t.Fatal(err)
 	}
+	// What cp --preserve=xattr copies from a file in the mount: the upload
+	// decides these, so they are ignored rather than refused.
+	for _, name := range []string{vfs.XattrUUID, vfs.XattrMD5, vfs.XattrMeta + "ucfs:path"} {
+		if err := env.FS.Setxattr(ctx, e.Node, name, []byte("copied"), 0); err != nil {
+			t.Errorf("setxattr %s on a pending file = %v, want it ignored", name, err)
+		}
+	}
+	if err := env.FS.Setxattr(ctx, e.Node, vfs.XattrMeta+"a b", []byte("v"), 0); !errors.Is(err, syscall.EINVAL) {
+		t.Errorf("bad key on a pending file = %v, want EINVAL", err)
+	}
 	if err := env.FS.Removexattr(ctx, e.Node, vfs.XattrMeta+"gone"); err != nil {
 		t.Fatal(err)
 	}
