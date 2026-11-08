@@ -92,7 +92,14 @@ func (f *FS) details(ctx context.Context, uuid string, refresh bool) (index.Deta
 	case !refresh || f.opts.Remote == nil || f.now().Sub(d.RefreshedAt) < f.opts.MetaTTL || f.degraded() != nil:
 		return d, nil
 	}
-	if _, err, _ := f.refreshes.Do(uuid, func() (any, error) { return nil, f.refresh(ctx, uuid) }); err != nil {
+	// A reader that found the entry stale just before another reader's
+	// refresh ended would otherwise refresh it again.
+	if _, err, _ := f.refreshes.Do(uuid, func() (any, error) {
+		if cur, err := f.ix.Details(ctx, uuid); err == nil && f.now().Sub(cur.RefreshedAt) < f.opts.MetaTTL {
+			return nil, nil
+		}
+		return nil, f.refresh(ctx, uuid)
+	}); err != nil {
 		slog.Warn("refresh file info; serving the index", "uuid", uuid, "err", err)
 		return d, nil
 	}
@@ -125,7 +132,11 @@ func (f *FS) md5(ctx context.Context, d index.Details) (string, error) {
 	if d.MD5 != "" {
 		return d.MD5, nil
 	}
+	// Re-read inside the flight, as details does for refreshes.
 	v, err, _ := f.md5s.Do(d.UUID, func() (any, error) {
+		if cur, err := f.ix.Details(ctx, d.UUID); err == nil && cur.MD5 != "" {
+			return cur.MD5, nil
+		}
 		f.stats.md5Heads.Add(1)
 		info, err := f.cdn.Head(context.WithoutCancel(ctx), d.UUID, "")
 		if err != nil {

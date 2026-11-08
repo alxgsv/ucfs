@@ -371,7 +371,12 @@ func (f *FS) group(ctx context.Context, id string) (index.Group, error) {
 	case f.opts.Remote == nil:
 		return g, syscall.ENOENT
 	}
-	if _, err, _ := f.groupFetch.Do(id, func() (any, error) { return nil, f.fetchGroup(ctx, id) }); err != nil {
+	if _, err, _ := f.groupFetch.Do(id, func() (any, error) {
+		if g, err := f.ix.Group(ctx, id); err == nil && g.Fetched {
+			return nil, nil
+		}
+		return nil, f.fetchGroup(ctx, id)
+	}); err != nil {
 		return g, err
 	}
 	g, err = f.ix.Group(ctx, id)
