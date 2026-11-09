@@ -1,0 +1,84 @@
+# goreleaser v2. A tag v* pushed to GitHub runs it through
+# .github/workflows/release.yml; `make snapshot` builds the same archives
+# locally into dist/ without publishing. The owner alxgsv appears here, in
+# scripts/install.sh and in the docs: docs/release.md lists every place.
+version: 2
+
+project_name: ucfs
+
+builds:
+  - id: ucfs
+    main: ./cmd/ucfs
+    binary: ucfs
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .Commit }}
+      - -X main.date={{ .Date }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: ucfs
+    formats:
+      - tar.gz
+    # scripts/install.sh builds the same name.
+    name_template: "ucfs_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE*
+      - contrib/**/*
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  use: github-native
+
+release:
+  github:
+    owner: alxgsv
+    name: ucfs
+  prerelease: auto
+
+# A formula, not a cask: a formula has a test block and the binary gets no
+# quarantine attribute. goreleaser deprecates brews for homebrew_casks:
+# `goreleaser check` warns on 2.14 and exits 2 on 2.20; releases still publish it.
+brews:
+  - name: ucfs
+    repository:
+      owner: alxgsv
+      name: homebrew-tap
+      branch: main
+      token: '{{ index .Env "HOMEBREW_TAP_TOKEN" }}'
+    directory: Formula
+    homepage: https://github.com/alxgsv/ucfs
+    description: Mount an Uploadcare project as a local filesystem
+    license: MIT
+    commit_msg_template: "ucfs {{ .Tag }}"
+    # Releases ship without Homebrew until alxgsv/homebrew-tap and
+    # HOMEBREW_TAP_TOKEN exist: the formula is built into dist/ and attached
+    # nowhere. Set to auto then, which also skips pre-releases.
+    skip_upload: true
+    install: |
+      bin.install "ucfs"
+      pkgshare.install "contrib"
+    test: |
+      assert_match "ucfs #{version} ", shell_output("#{bin}/ucfs version")
+    caveats: |
+      ucfs is experimental. Mount a project with
+        ucfs mount ~/Uploadcare
+      using the keys in ~/.uploadcare/config.yaml or UPLOADCARE_PUBLIC_KEY and
+      UPLOADCARE_SECRET_KEY. On Linux it needs fusermount3 (package fuse3).
+      Docs: https://github.com/alxgsv/ucfs#readme
+      launchd and systemd examples: #{opt_pkgshare}/contrib

@@ -1,0 +1,26 @@
+# Mounts an Uploadcare project at a path for the user, as a user unit. The
+# instance name is the escaped mount path: for ~/Uploadcare,
+#   systemctl --user enable --now "ucfs@$(systemd-escape --path ~/Uploadcare).service"
+# Mount flags go in UCFS_MOUNT_FLAGS, set in a drop-in of the instance. See
+# README.md next to this file.
+
+[Unit]
+Description=ucfs: Uploadcare project mounted at %f
+Documentation=https://github.com/alxgsv/ucfs
+
+[Service]
+Type=simple
+Environment=UCFS_MOUNT_FLAGS=
+ExecStart=/usr/local/bin/ucfs mount $UCFS_MOUNT_FLAGS %f
+# systemd runs ExecStop also when the daemon exited by itself after
+# `ucfs umount`; nothing is mounted then, and that umount's failure would
+# count as the unit's and restart it.
+ExecStop=-/usr/local/bin/ucfs umount %f
+# Restart after a failure, not after `ucfs umount`, which exits 0.
+Restart=on-failure
+RestartSec=30
+# Unmounting uploads what is still being written and waits up to 2 minutes.
+TimeoutStopSec=150
+
+[Install]
+WantedBy=default.target

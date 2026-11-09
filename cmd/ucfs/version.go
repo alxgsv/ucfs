@@ -8,8 +8,13 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// version is set with -ldflags "-X main.version=..." by the Makefile.
-var version = "dev"
+// version, commit and date are set with -ldflags "-X main.version=..." by
+// the Makefile (version only) and by goreleaser (all three).
+var (
+	version = "dev"
+	commit  = ""
+	date    = ""
+)
 
 func newVersionCmd() *cobra.Command {
 	return &cobra.Command{
@@ -17,17 +22,30 @@ func newVersionCmd() *cobra.Command {
 		Short: "Print version information",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			commit := "unknown"
-			if bi, ok := debug.ReadBuildInfo(); ok {
-				for _, s := range bi.Settings {
-					if s.Key == "vcs.revision" {
-						commit = s.Value
-					}
-				}
-			}
-			_, err := fmt.Fprintf(cmd.OutOrStdout(), "ucfs %s (commit %s, %s, %s/%s)\n",
-				version, commit, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+			_, err := fmt.Fprintln(cmd.OutOrStdout(), versionLine())
 			return err
 		},
 	}
+}
+
+func versionLine() string {
+	c, d := commit, date
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range bi.Settings {
+			switch {
+			case s.Key == "vcs.revision" && c == "":
+				c = s.Value
+			case s.Key == "vcs.time" && d == "":
+				d = s.Value
+			}
+		}
+	}
+	if c == "" {
+		c = "unknown"
+	}
+	built := ""
+	if d != "" {
+		built = ", built " + d
+	}
+	return fmt.Sprintf("ucfs %s (commit %s%s, %s, %s/%s)", version, c, built, runtime.Version(), runtime.GOOS, runtime.GOARCH)
 }

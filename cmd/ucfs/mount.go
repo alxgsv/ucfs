@@ -57,17 +57,25 @@ type mounted interface {
 
 func newMountCmd(g *globalFlags) *cobra.Command {
 	f := &mountFlags{}
+	var daemon bool
 	cmd := &cobra.Command{
 		Use:   "mount <dir>",
 		Short: "Mount the project at dir and serve it until unmounted",
 		Long: "Mounts the project and keeps running in the foreground until\n" +
 			"`ucfs umount <dir>`, an external umount, or Ctrl-C. Files written in tree/ or\n" +
-			"files/ are uploaded; see `ucfs resolve` for the uuid a write got.",
+			"files/ are uploaded; see `ucfs resolve` for the uuid a write got.\n" +
+			"With --daemon it returns once the mount is up and keeps serving in the background.",
 		Args: cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error { return runMount(cmd.Context(), g, f, args[0]) },
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if daemon && !isDaemonChild() {
+				return runDaemon(cmd.Context(), g, args[0], cmd.OutOrStdout())
+			}
+			return runMount(cmd.Context(), g, f, args[0])
+		},
 	}
 	fl := cmd.Flags()
 	fl.StringVar(&f.frontend, "frontend", defaultFrontend, "nfs or fuse (fuse is Linux only)")
+	fl.BoolVar(&daemon, "daemon", false, "serve in the background, logging to <cache dir>/mount-<hash>.log; stop with ucfs umount")
 	fl.BoolVar(&f.readOnly, "read-only", false, "mount read-only; on macOS this also stops Finder writing .DS_Store files")
 	fl.IntVar(&f.readAhead, "readahead", 0, "macOS NFS client read-ahead in 1 MiB blocks; ucfs prefetches by itself")
 	fl.BoolVar(&f.browse, "browse", false, "show the mount in the Finder sidebar (macOS)")

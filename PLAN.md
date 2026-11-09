@@ -50,9 +50,11 @@ internal/ctl/                  unix-socket control API used by `ucfs status`
 internal/fake/                 httptest doubles for REST, Upload API and CDN used by tests
 third_party/go-nfs/            go-nfs at the pinned commit with the errno, COMMIT and exclusive-create patches (README.ucfs.md), wired in by a go.mod replace
 testdata/                      golden files, fixtures
-docs/                          mount options, troubleshooting, Finder notes
+docs/                          mount options, Finder notes, costs, semantics, troubleshooting, release, phase reports
 spikes/                        measurement tools: photogen, rest, keygrep (keys in logs), benchtable (benchmark tables), measure/*.sh
-Makefile  .github/workflows/ci.yml (Phase 5)  .goreleaser.yaml  CLAUDE.md  AGENTS.md (Phase 6)
+scripts/install.sh             installer for release archives (Phase 6)
+contrib/                       launchd and systemd examples (Phase 6)
+Makefile  .github/workflows/ci.yml (Phase 5)  .github/workflows/release.yml  .goreleaser.yaml  CLAUDE.md  AGENTS.md (Phase 6)
 ```
 
 ## 3. Phases
@@ -322,14 +324,43 @@ is `make soak`.
 
 ### Phase 6: Packaging and docs (≈ 3 days)
 
-39. Decide where the public repo lives (`alxgsv/ucfs` or the `uploadcare` org), make it public, and name the Homebrew tap to match.
-40. `.goreleaser.yaml`: darwin arm64/amd64, linux amd64/arm64; Homebrew tap formula; `install.sh` in the style of the CLI.
-41. launchd plist and systemd unit examples for persistent mounts; `ucfs mount --daemon`.
-42. `docs/`: mount options, Finder and Spotlight notes, cost guidance (what pulls CDN traffic), semantics table
-    (what works, what returns `EOPNOTSUPP`), troubleshooting.
-43. `CLAUDE.md`/`AGENTS.md` with build, test and live-test instructions.
+39. Decided on 2026-11-08 and recorded in [docs/release.md](docs/release.md): the repository stays `alxgsv/ucfs`,
+    the licence is MIT ([LICENSE](LICENSE)), and 0.1.0 ships without Homebrew: the formula is built but not pushed
+    (`skip_upload: true`) until the tap `alxgsv/homebrew-tap` and `HOMEBREW_TAP_TOKEN` exist. The binaries are not
+    signed or notarized. The doc has the owner's steps for 0.1.0 (make the repository public, fix the Actions
+    billing, push `v0.1.0`), how to test on a fresh Mac with Gatekeeper on, the Homebrew steps, and every place to
+    change for a later move to the `uploadcare` organization. None of the steps is done.
+40. `.goreleaser.yaml` (goreleaser v2): `CGO_ENABLED=0` builds for darwin and linux on amd64 and arm64 with
+    `-trimpath`, version, commit and date in `ucfs version`; `ucfs_<version>_<os>_<arch>.tar.gz` archives with the
+    README and `contrib/`; `checksums.txt`; a Homebrew formula with a `test do` (`ucfs version`), caveats and
+    `contrib/` in `pkgshare`, for the tap with `HOMEBREW_TAP_TOKEN` but not pushed for 0.1.0 (`skip_upload: true`). It uses the
+    deprecated `brews` section, as casks have no test block and are quarantined: goreleaser 2.20's `check` exits 2
+    on it. `.github/workflows/release.yml` runs the tests and goreleaser on a `v*` tag; `make snapshot` builds
+    `dist/` locally. `scripts/install.sh` follows uploadcare-cli's: `VERSION`, `INSTALL_DIR`, `UNINSTALL` and flags
+    of the same names, checksum check, `sudo` only when the directory needs it, plus `--base-url`/`UCFS_BASE_URL`
+    for a local `dist/`; it picks the archive from `checksums.txt`, so the latest release needs no API call.
+41. `ucfs mount --daemon` (`cmd/ucfs/daemon.go`) runs the same command again in its own session, stdin from
+    `/dev/null`, output appended to `<cache dir>/mount-<hash>.log`, and returns with the pid once the control socket
+    answers; a daemon that exits first fails the command with what it logged, and one still starting after 10 minutes
+    keeps running. `contrib/launchd/com.uploadcare.ucfs.example.plist` (a user agent: `RunAtLoad`, `KeepAlive` on
+    failure only, `ExitTimeOut` 60 s, the most launchd allows an agent, for the uploads an unmount finishes) and `contrib/systemd/ucfs@.service` (a
+    user unit per escaped mount path: `Type=simple`, `ExecStop=-ucfs umount`, `Restart=on-failure`, flags in a
+    drop-in), each with a README. After a crash both restart into the stale mount until `ucfs umount <dir>` clears
+    it (item 52).
+42. `README.md` and `docs/`: [mount-options.md](docs/mount-options.md) (every command and flag, and the
+    `status --json` fields, Phase 5's included), [finder.md](docs/finder.md), [costs.md](docs/costs.md),
+    [semantics.md](docs/semantics.md) (results and errnos per operation, place and front-end, from the code, with
+    those seen on a mount marked), [troubleshooting.md](docs/troubleshooting.md), [release.md](docs/release.md).
+43. `AGENTS.md`: build, test and lint, the mount tests and live checks, test uploads marked `ucfs:test=1`, leaving no
+    mount or registry record behind, secrets, commit signing and one PR per phase; `CLAUDE.md` imports it.
 
-Result: `brew install alxgsv/tap/ucfs && ucfs mount ~/uc` on a fresh Mac (tap name follows step 39).
+Result: the install script and `ucfs mount ~/uc` on a fresh Mac once 0.1.0 is released; `brew install
+alxgsv/tap/ucfs` from a later release (step 39). Measured in [docs/phase6.md](docs/phase6.md): `goreleaser release --snapshot` builds the four archives
+(5.3–5.9 MB); `install.sh` installs from a local server on macOS and on Linux (dash); the generated formula installs
+through a local tap and passes `brew test`; `ucfs mount --daemon` returns in 1.0 s with the mount up, and
+`ls -lR` through it costs 0 CDN bytes; the launchd agent and the systemd unit mount, stay down after `ucfs umount`,
+restart after a failure, and leave nothing behind; after the Phase 5 merge the same `--daemon`, launchd and systemd
+mounts came up again in 0.1–2 s, read-only, for 2 REST requests and no CDN bytes.
 
 ### After V1 (release follow-ups)
 
@@ -368,6 +399,34 @@ Work found during the phases that does not block the V1 release. Phases append h
     exclusive CREATE as guarded, and the ACCESS filter (`third_party/go-nfs/README.ucfs.md`). Needs the user's OK
     before anything is sent. Done: pull requests open on `willscott/go-nfs`, and, once merged, the `replace` in
     `go.mod` and the copy removed.
+52. Let a restarted daemon clear the stale mount at its own directory. After a daemon is killed (SIGKILL from launchd
+    past `ExitTimeOut`, the OOM killer, a crash), its mount point stays attached to a server that is gone, and the
+    restarts the launchd and systemd examples make fail on it ("operation timed out" over NFS, "device or resource
+    busy" over FUSE) until someone runs `ucfs umount <dir>` (docs/phase6.md, *launchd* and *systemd*). In `runMount`,
+    before mounting: when the registry record for the directory names a dead pid and the directory is still a mount,
+    unmount it as `ucfs umount` does. Done: the Phase 6 crash checks (`kill -9` of the daemon under launchd and under
+    systemd) mount again by themselves, with no `ucfs umount`.
+53. Make `make build` stamp the commit and date. goreleaser sets `main.commit` and `main.date`; the Makefile sets only
+    `main.version`, from `git describe`, so a source build prints a `v`-prefixed version and takes the commit from the
+    Go build info, which a build outside a checkout lacks and a build in a git worktree got wrong (docs/phase6.md,
+    *After the Phase 5 merge*). Pass `-X main.commit=` and `-X main.date=` from git and drop the `v`. Done: `make
+    build` on a tagged commit prints the same `ucfs version` line as the release archive, apart from the build date,
+    and a build in a worktree inside another checkout prints the worktree's commit without running git in the outer
+    checkout.
+54. Lint the workflows with actionlint, and run the release workflow once. Installing actionlint was refused in Phase
+    6's session, so `release.yml` was only parsed as YAML, and it has never run. Done: `actionlint` reports nothing
+    on both workflows, from CI or a make target, and the workflow has published a pre-release tag (`v0.1.0-rc.1`).
+55. Publish to Homebrew. 0.1.0 ships without it (step 39): create the tap `alxgsv/homebrew-tap`, store a
+    fine-grained `HOMEBREW_TAP_TOKEN` limited to it, and set `skip_upload: auto` ([docs/release.md](docs/release.md),
+    *Homebrew later*). goreleaser deprecates the `brews` section the formula uses (2.20's `check` exits 2); move to
+    casks only if a cask can keep the `test` and avoid the quarantine. Needs the owner. Done: `brew install
+    alxgsv/tap/ucfs` on a fresh Mac installs the release, and `brew test ucfs` passes.
+56. Sign and notarize the macOS binaries. They are unsigned (darwin/arm64 carries only the linker's ad-hoc
+    signature), so a browser download is quarantined and refused until `xattr -d com.apple.quarantine`; the install
+    script and Homebrew avoid the quarantine. Needs an Apple Developer account, a Developer ID Application
+    certificate and an App Store Connect API key as repository secrets, for goreleaser's `notarize` section. Done: a
+    release binary downloaded with Safari runs on a Mac with Gatekeeper on without a dialog, and `spctl --assess`
+    accepts it.
 
 ## 4. Cross-cutting specifications
 
